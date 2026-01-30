@@ -20,7 +20,10 @@ import numpy as np
 import torch
 from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
 from qwen_tts.core.models.modeling_qwen3_tts import mel_spectrogram
-from torch.utils.data import Dataset
+from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
+from torch.utils.data import Dataset, DataLoader
+import json
+from transformers import AutoConfig
 
 AudioLike = Union[
     str,                     # wav path, URL, base64
@@ -36,6 +39,18 @@ class TTSDataset(Dataset):
         self.processor = processor
         self.lag_num = lag_num
         self.config = config
+        self.special_types = ["SPECIAL", "PLAIN_WORD"]
+
+        assert self.processor.tokenizer.is_fast, "Processor must be a fast tokenizer"
+
+        # Build entity type vocabulary with required base types
+        entity_types = set([entity["type"] for line in data_list for entity in line["entities"]])
+        for special_type in self.special_types:
+            if special_type not in entity_types:
+                entity_types.add(special_type)
+        entity_types = sorted(list(entity_types))
+        self.entity_type_to_index = {entity_type: i for i, entity_type in enumerate(entity_types)}
+        self.index_to_entity_type = {v: k for k, v in self.entity_type_to_index.items()}
 
     def __len__(self):
         return len(self.data_list)
@@ -95,14 +110,16 @@ class TTSDataset(Dataset):
         return x if isinstance(x, list) else [x]
     
     def _tokenize_texts(self, text) -> List[torch.Tensor]:
-        input = self.processor(text=text, return_tensors="pt", padding=True)
+        input = self.processor(text=text, return_tensors="pt", padding=True, return_offsets_mapping=True)
+        offsets = input.pop("offset_mapping", None)
         input_id = input["input_ids"]
         input_id = input_id.unsqueeze(0) if input_id.dim() == 1 else input_id
-        return input_id
+        return input_id, offsets
     
     @torch.inference_mode()
     def extract_mels(self, audio, sr):
-        assert sr == 24000, "Only support 24kHz audio"
+        if sr != 24000:
+            audio = librosa.resample(y=audio, orig_sr=sr, target_sr=24000)
         mels = mel_spectrogram(
             torch.from_numpy(audio).unsqueeze(0), 
             n_fft=1024, 
@@ -114,8 +131,30 @@ class TTSDataset(Dataset):
             fmax=12000
         ).transpose(1, 2)
         return mels
+    
+    def _align_entities_with_text(self, offset_mapping, entities):
+        num_tokens = len(offset_mapping)
+        token_labels = ["PLAIN_WORD"] * num_tokens
 
+        prefix_len = len("<|im_start|>assistant\n")
 
+        for idx, (token_start, token_end) in enumerate(offset_mapping):
+            if token_start == token_end == 0:
+                token_labels[idx] = "SPECIAL"
+                continue
+            
+            for entity in entities:
+                ent_start = entity['start'] + prefix_len
+                ent_end = entity['end'] + prefix_len
+                ent_type = entity['type']
+                
+                if token_start < ent_end and token_end > ent_start:
+                    token_labels[idx] = ent_type
+                    break
+
+        plain_idx = self.entity_type_to_index.get("PLAIN_WORD")
+        token_label_ids = [self.entity_type_to_index.get(label, plain_idx) for label in token_labels]
+        return token_label_ids
 
     def __getitem__(self, idx):
         item = self.data_list[idx]
@@ -124,10 +163,14 @@ class TTSDataset(Dataset):
         text        = item["text"]
         audio_codes = item["audio_codes"]
         language        = item.get('language','Auto')
-        ref_audio_path  = item['ref_audio']
+        ref_audio_path  = "/speech/arjun/shoutrik/DATA/giga/SEGMENTED_AUDIO_22k/AUD0000000004_S0000001.wav" # item['ref_audio']
+        entities        = item['entities']
 
         text = self._build_assistant_text(text)
-        text_ids = self._tokenize_texts(text)
+        text_ids, offsets = self._tokenize_texts(text)
+        text_ids = text_ids[:,:-5]
+        offsets = offsets[0, 3:-5] if offsets.dim() == 3 else offsets[3:-5]
+        entity_labels = self._align_entities_with_text(offsets, entities)
 
         audio_codes = torch.tensor(audio_codes, dtype=torch.long)
 
@@ -138,12 +181,16 @@ class TTSDataset(Dataset):
         ref_mel = self.extract_mels(audio=wav, sr=sr)
 
         return {
-            "text_ids": text_ids[:,:-5],    # 1 , t
+            "text_ids":text_ids,    # 1 , t
             "audio_codes":audio_codes,      # t, 16
-            "ref_mel":ref_mel
+            "ref_mel":ref_mel,
+            "entities":entity_labels
         }
         
     def collate_fn(self, batch):
+
+        # print(batch)
+
         assert self.lag_num == -1
 
         item_length = [b['text_ids'].shape[1] + b['audio_codes'].shape[0] for b in batch]
@@ -158,6 +205,8 @@ class TTSDataset(Dataset):
         attention_mask  = torch.zeros((b,t),dtype=torch.long)
         codec_0_labels  = torch.full((b, t), -100, dtype=torch.long)
 
+        entities = torch.full((b, t, 1), -100, dtype=torch.long)
+
         for i,data in enumerate(batch):
             text_ids        = data['text_ids']
             audio_codec_0   = data['audio_codes'][:,0]
@@ -171,6 +220,15 @@ class TTSDataset(Dataset):
             input_ids[i, 3:7, 0] = self.config.tts_pad_token_id
             input_ids[i,   7, 0] = self.config.tts_bos_token_id
             input_ids[i, 8:8+text_ids_len-3, 0] = text_ids[0,3:]
+
+            # Only set entity labels for actual entities (not SPECIAL or PLAIN_WORD)
+            # All other positions remain -100
+            entity_labels = torch.tensor(data['entities'], dtype=torch.long)
+            special_indices = torch.tensor([self.entity_type_to_index[t] for t in self.special_types])
+            is_actual_entity = ~torch.isin(entity_labels, special_indices)
+            entity_len = len(entity_labels)
+            entities[i, 8:8+entity_len, 0] = torch.where(is_actual_entity, entity_labels, -100)
+
             input_ids[i,   8+text_ids_len-3, 0] = self.config.tts_eos_token_id
             input_ids[i, 8+text_ids_len-2:8+text_ids_len+codec_ids_len , 0] = self.config.tts_pad_token_id
             text_embedding_mask[i,  :8+text_ids_len+codec_ids_len] = True
@@ -214,5 +272,6 @@ class TTSDataset(Dataset):
             'codec_embedding_mask':codec_embedding_mask.unsqueeze(-1),
             'codec_0_labels':codec_0_labels,
             'codec_ids': codec_ids,
-            'codec_mask':codec_mask
+            'codec_mask':codec_mask,
+            'entities':entities,
         }

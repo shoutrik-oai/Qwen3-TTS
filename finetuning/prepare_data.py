@@ -16,10 +16,10 @@
 
 import json
 import os
-
+from tqdm import tqdm
 from qwen_tts import Qwen3TTSTokenizer
 
-BATCH_INFER_NUM = 64
+BATCH_INFER_NUM = 32
 
 JSONL_PATHS = [
     "/speech/arjun/shoutrik/DATA/giga/metadata.jsonl",
@@ -61,7 +61,7 @@ def main():
         batch_audios = []
         to_write = []
         
-        for line in lines_to_process:
+        for line in tqdm(lines_to_process, desc="Processing lines", total=len(lines_to_process)):
             batch_lines.append(line)
             batch_audios.append(line['wav_path'])
 
