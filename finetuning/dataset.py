@@ -22,6 +22,7 @@ from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
 from qwen_tts.core.models.modeling_qwen3_tts import mel_spectrogram
 from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
 from torch.utils.data import Dataset, DataLoader
+import torch.nn.functional as F
 import json
 from transformers import AutoConfig
 
@@ -58,11 +59,13 @@ class TTSDataset(Dataset):
     def _load_audio_to_np(self, x: str) -> Tuple[np.ndarray, int]:
         
         audio, sr = librosa.load(x, sr=None, mono=True)
+        if sr is not None and sr != 24000:
+            audio = librosa.resample(y=audio, orig_sr=sr, target_sr=24000)
 
         if audio.ndim > 1:
             audio = np.mean(audio, axis=-1)
 
-        return audio.astype(np.float32), int(sr)
+        return audio.astype(np.float32), 24000
 
     def _normalize_audio_inputs(self, audios: Union[AudioLike, List[AudioLike]]) -> List[Tuple[np.ndarray, int]]:
         """
@@ -93,13 +96,20 @@ class TTSDataset(Dataset):
         out: List[Tuple[np.ndarray, int]] = []
         for a in items:
             if isinstance(a, str):
-                out.append(self._load_audio_to_np(a))
+                audio, sr = self._load_audio_to_np(a)
             elif isinstance(a, tuple) and len(a) == 2 and isinstance(a[0], np.ndarray):
-                out.append((a[0].astype(np.float32), int(a[1])))
+                audio, sr = a[0].astype(np.float32), int(a[1])
             elif isinstance(a, np.ndarray):
                 raise ValueError("For numpy waveform input, pass a tuple (audio, sr).")
             else:
                 raise TypeError(f"Unsupported audio input type: {type(a)}")
+            
+            # Normalize waveform to [-1, 1] range
+            max_val = np.abs(audio).max()
+            if max_val > 1.0:
+                audio = audio / max_val
+            
+            out.append((audio, sr))
         return out
 
     
@@ -118,8 +128,6 @@ class TTSDataset(Dataset):
     
     @torch.inference_mode()
     def extract_mels(self, audio, sr):
-        if sr != 24000:
-            audio = librosa.resample(y=audio, orig_sr=sr, target_sr=24000)
         mels = mel_spectrogram(
             torch.from_numpy(audio).unsqueeze(0), 
             n_fft=1024, 
@@ -133,7 +141,7 @@ class TTSDataset(Dataset):
         return mels
     
     def _align_entities_with_text(self, offset_mapping, entities):
-        num_tokens = len(offset_mapping)
+        num_tokens = offset_mapping.shape[0]
         token_labels = ["PLAIN_WORD"] * num_tokens
 
         prefix_len = len("<|im_start|>assistant\n")
@@ -154,7 +162,7 @@ class TTSDataset(Dataset):
 
         plain_idx = self.entity_type_to_index.get("PLAIN_WORD")
         token_label_ids = [self.entity_type_to_index.get(label, plain_idx) for label in token_labels]
-        return token_label_ids
+        return token_labels, token_label_ids
 
     def __getitem__(self, idx):
         item = self.data_list[idx]
@@ -163,14 +171,21 @@ class TTSDataset(Dataset):
         text        = item["text"]
         audio_codes = item["audio_codes"]
         language        = item.get('language','Auto')
-        ref_audio_path  = "/speech/arjun/shoutrik/DATA/giga/SEGMENTED_AUDIO_22k/AUD0000000004_S0000001.wav" # item['ref_audio']
+        ref_audio_path  = item['ref_audio']
         entities        = item['entities']
 
+        # print(f"text: {text}")
         text = self._build_assistant_text(text)
+        # print(f"text after build: {text}")
+
         text_ids, offsets = self._tokenize_texts(text)
         text_ids = text_ids[:,:-5]
         offsets = offsets[0, 3:-5] if offsets.dim() == 3 else offsets[3:-5]
-        entity_labels = self._align_entities_with_text(offsets, entities)
+        entity_labels, entity_label_ids = self._align_entities_with_text(offsets, entities)
+
+        # for text_id, entity_label, entity_label_id in zip(text_ids[0, 3:], entity_labels, entity_label_ids):
+        #     print(f"text id : {text_id}, text token: {self.processor.tokenizer.decode(text_id)}, entity label: {entity_label} ({entity_label_id})\n")
+
 
         audio_codes = torch.tensor(audio_codes, dtype=torch.long)
 
@@ -179,14 +194,18 @@ class TTSDataset(Dataset):
         wav,sr = normalized[0]
 
         ref_mel = self.extract_mels(audio=wav, sr=sr)
+        # print(f"length of text : {len(text_ids[0, 3:])}")
+        # print(f"length of entity labels : {len(entity_label_ids)}")
+        # print(f"text : {self.processor.tokenizer.decode(text_ids[0, 3:])}")
+        # print(f"entity labels : {entity_labels}")
 
         return {
             "text_ids":text_ids,    # 1 , t
             "audio_codes":audio_codes,      # t, 16
             "ref_mel":ref_mel,
-            "entities":entity_labels
+            "entities":entity_label_ids
         }
-        
+       
     def collate_fn(self, batch):
 
         # print(batch)
@@ -206,6 +225,7 @@ class TTSDataset(Dataset):
         codec_0_labels  = torch.full((b, t), -100, dtype=torch.long)
 
         entities = torch.full((b, t, 1), -100, dtype=torch.long)
+        text_only_mask = torch.zeros((b, t), dtype=torch.bool)  # Mask for text positions only (not audio)
 
         for i,data in enumerate(batch):
             text_ids        = data['text_ids']
@@ -221,18 +241,30 @@ class TTSDataset(Dataset):
             input_ids[i,   7, 0] = self.config.tts_bos_token_id
             input_ids[i, 8:8+text_ids_len-3, 0] = text_ids[0,3:]
 
+            # print(f"text ids length : {text_ids_len}")
+            # print(f"text ids : {input_ids}")
+
             # Only set entity labels for actual entities (not SPECIAL or PLAIN_WORD)
             # All other positions remain -100
             entity_labels = torch.tensor(data['entities'], dtype=torch.long)
-            special_indices = torch.tensor([self.entity_type_to_index[t] for t in self.special_types])
-            is_actual_entity = ~torch.isin(entity_labels, special_indices)
+            # special_indices = torch.tensor([self.entity_type_to_index[t] for t in self.special_types])
+            # is_actual_entity = ~torch.isin(entity_labels, special_indices)
             entity_len = len(entity_labels)
-            entities[i, 8:8+entity_len, 0] = torch.where(is_actual_entity, entity_labels, -100)
+            # print(f"entity labels length : {entity_len}")
+
+            # entities[i, 8:8+entity_len, 0] = torch.where(is_actual_entity, entity_labels, -100)
+            entities[i, 8:8+entity_len, 0] = entity_labels
+            # print(f"entities : {entities}")
 
             input_ids[i,   8+text_ids_len-3, 0] = self.config.tts_eos_token_id
             input_ids[i, 8+text_ids_len-2:8+text_ids_len+codec_ids_len , 0] = self.config.tts_pad_token_id
             text_embedding_mask[i,  :8+text_ids_len+codec_ids_len] = True
-
+            
+            # text_only_mask: covers ONLY actual text content tokens (position 8 onwards)
+            # Excludes: header (0-7), EOS, and audio positions
+            # This aligns exactly with where entity labels are defined
+            text_only_mask[i, 8:8+text_ids_len-3] = True  # text_ids_len-3 = remaining tokens after first 3
+            # print(f"text only mask : {text_only_mask}")
             # codec channel
             # input_ids[i,   :3, 1] = 0
             input_ids[i,    3:8 ,1] = torch.tensor(
@@ -261,8 +293,12 @@ class TTSDataset(Dataset):
             codec_mask[i,   8+text_ids_len-1:8+text_ids_len-1+codec_ids_len] = True
             attention_mask[i, :8+text_ids_len+codec_ids_len] = True
         
-        ref_mels = [data['ref_mel'] for data in batch]
-        ref_mels = torch.cat(ref_mels,dim=0)
+        ref_mels = [data['ref_mel'] for data in batch]  # List of [1, T_i, 128]
+        max_mel_len = max(m.size(1) for m in ref_mels)
+        ref_mels = torch.cat([
+            F.pad(m, (0, 0, 0, max_mel_len - m.size(1))) 
+            for m in ref_mels
+        ], dim=0) 
 
         return {
             'input_ids':input_ids,
@@ -274,4 +310,5 @@ class TTSDataset(Dataset):
             'codec_ids': codec_ids,
             'codec_mask':codec_mask,
             'entities':entities,
+            'text_only_mask':text_only_mask,  # [B, T] mask for text positions only (for EntityInjectionModule)
         }
