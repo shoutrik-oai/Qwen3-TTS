@@ -59,12 +59,24 @@ class EntityInjectionModuleConfig:
     dropout: float = 0.1
     activation: str = "gelu"
     batch_first: bool = True
-    classifier_warmup_steps: int = 0  # Train classifier only (no injection) for this many steps
+    # 3-Stage Training Configuration:
+    # Stage 1 (0 → classifier_warmup_steps): Base frozen, entity classifier trains, gate=0 (no injection)
+    # Stage 2a (classifier_warmup_steps → gate_freeze_steps): Full training, gate=fixed_gate_value
+    # Stage 2b (gate_freeze_steps+): Full training, gate=learned (clamped to gate_min)
+    classifier_warmup_steps: int = 0   # End of Stage 1
+    gate_freeze_steps: int = 0         # End of Stage 2a
+    fixed_gate_value: float = 0.1      # Gate value during Stage 2a
+    gate_min: float = 0.05             # Minimum gate value during Stage 2b
 
 
 class EntityInjectionModule(nn.Module):
     """
     Learns entity-aware representations from text embeddings.
+    
+    3-Stage Training:
+        Stage 1 (0 → classifier_warmup_steps): gate=0, no injection, only classifier trains
+        Stage 2a (classifier_warmup_steps → gate_freeze_steps): gate=fixed, injection active
+        Stage 2b (gate_freeze_steps+): gate=learned with min clamp
     
     Input:
         text_embeddings: [B, T, D] - text token embeddings
@@ -91,8 +103,13 @@ class EntityInjectionModule(nn.Module):
         self.num_entities = config.num_entities
         self.type_head = nn.Linear(hidden_size, self.num_entities)
         self.entity_delta_proj = nn.Linear(hidden_size, hidden_size)
-        self.gate_proj = nn.Linear(hidden_size, 1)  # Per-token gating: sigmoid(linear(type_hidden))
-        self.classifier_warmup_steps = config.classifier_warmup_steps  # Train classifier only for this many steps
+        self.gate_proj = nn.Linear(hidden_size, 1)  # Per-token gating
+        
+        # 3-Stage training config
+        self.classifier_warmup_steps = config.classifier_warmup_steps  # End of Stage 1
+        self.gate_freeze_steps = config.gate_freeze_steps              # End of Stage 2a
+        self.fixed_gate_value = config.fixed_gate_value                # Gate value during Stage 2a
+        self.gate_min = config.gate_min                                # Min gate during Stage 2b
         self._init_weights()
     
     def _init_weights(self):
@@ -101,9 +118,9 @@ class EntityInjectionModule(nn.Module):
         nn.init.zeros_(self.entity_delta_proj.bias)
         nn.init.xavier_uniform_(self.type_head.weight)
         nn.init.zeros_(self.type_head.bias)
-        # Initialize gate projection to output ~0 initially (sigmoid(0)=0.5, but with negative bias -> smaller gate)
+        # Initialize gate projection to output ~0 initially
         nn.init.normal_(self.gate_proj.weight, std=0.01)
-        nn.init.constant_(self.gate_proj.bias, -2.0)  # sigmoid(-2) ≈ 0.12, starts small
+        nn.init.constant_(self.gate_proj.bias, -2.0)  # sigmoid(-2) ≈ 0.12
     
     def forward(self, text_embeddings, text_mask=None, return_type_logits=False, current_step=0):
         """
@@ -116,7 +133,8 @@ class EntityInjectionModule(nn.Module):
         Returns:
             type_enriched: [B, T, D] entity-enriched embeddings
             type_logits: [B, T, num_entities] (optional) entity type predictions
-            gate: mean gate value (for logging)
+            gate: gate tensor [B, T, 1] (for logging and DDP)
+            training_stage: int (1, 2, or 3)
         """
         # TransformerEncoder expects src_key_padding_mask where True = ignore
         if text_mask is not None:
@@ -127,21 +145,32 @@ class EntityInjectionModule(nn.Module):
         # Encode with entity-aware transformer
         type_hidden = self.entity_encoder(text_embeddings, src_key_padding_mask=src_key_padding_mask)
         
-        # Project and gate the residual with per-token learned gating
+        # Project the residual
         type_delta = self.entity_delta_proj(type_hidden)
-        gate = torch.sigmoid(self.gate_proj(type_hidden))  # [B, T, 1] per-token gate
         
-        # Staged training: during warmup, only train classifier (don't inject into TTS)
+        # Compute learned gate (always compute for DDP, even if not used)
+        learned_gate = torch.sigmoid(self.gate_proj(type_hidden))  # [B, T, 1]
+        
+        # 3-Stage Training Logic:
         if current_step < self.classifier_warmup_steps:
-            # During warmup: don't inject entity info, but still compute gate for DDP
-            type_enriched = text_embeddings
-        else:
-            # After warmup: inject entity information into TTS
+            # STAGE 1: Classifier warmup - no injection, gate=0
+            gate = torch.zeros_like(learned_gate)
+            type_enriched = text_embeddings  # No injection
+            training_stage = 1
+        elif current_step < self.gate_freeze_steps:
+            # STAGE 2a: Full training with frozen gate
+            gate = torch.full_like(learned_gate, self.fixed_gate_value)
             type_enriched = text_embeddings + gate * type_delta
+            training_stage = 2
+        else:
+            # STAGE 2b: Full training with learned gate (clamped)
+            gate = torch.clamp(learned_gate, min=self.gate_min)
+            type_enriched = text_embeddings + gate * type_delta
+            training_stage = 3
         
         if return_type_logits:
-            type_logits = self.type_head(type_delta)
-            return type_enriched, type_logits, gate
+            type_logits = self.type_head(type_hidden)
+            return type_enriched, type_logits, gate, learned_gate, training_stage
         
         return type_enriched
 
@@ -153,7 +182,6 @@ class Qwen3TTSModelWithEntityInjection(nn.Module):
         self.qwen3_config = qwen3_config
         self.entity_injection_module = entity_injection_module
         self.special_indices = special_indices
-        # self.register_buffer('entity_loss_weights', entity_loss_weights)
         
     def forward(self, batch, current_step=0):
         input_ids = batch['input_ids']
@@ -166,15 +194,16 @@ class Qwen3TTSModelWithEntityInjection(nn.Module):
         codec_mask = batch['codec_mask']
         entities = batch['entities']  # [B, T, 1] with entity labels (-100 for non-entities)
 
-        
         target_speaker_embedding = self.base_model.speaker_encoder(ref_mels).detach()
 
         input_text_ids = input_ids[:, :, 0]
         input_codec_ids = input_ids[:, :, 1]
 
         input_text_embedding = self.base_model.talker.model.text_embedding(input_text_ids) * text_embedding_mask
-        text_only_mask = batch['text_only_mask']  
-        input_text_embedding, entity_type_logits, gate = self.entity_injection_module(
+        text_only_mask = batch['text_only_mask']
+        
+        # Entity injection with 3-stage training
+        input_text_embedding, entity_type_logits, gate, learned_gate, training_stage = self.entity_injection_module(
             input_text_embedding, 
             text_mask=text_only_mask.long(),
             return_type_logits=True,
@@ -192,14 +221,15 @@ class Qwen3TTSModelWithEntityInjection(nn.Module):
         entity_type_loss = F.cross_entropy(
             entity_type_logits.view(-1, entity_type_logits.size(-1)),
             entity_labels.view(-1),
-            ignore_index=-100,  # Ignore non-entity positions and special types
+            ignore_index=-100,
         )
-        # Add 0 * gate.sum() to ensure gate_proj is always in the computation graph for DDP
-        # (during warmup, gate isn't used in type_enriched, so this keeps gradients flowing)
-        entity_type_loss = entity_type_loss + 0.0 * gate.sum()
+        
+        # DDP FIX: Always include learned_gate in computation graph
+        # This ensures gate_proj participates in backward even during Stage 1 & 2a
+        entity_type_loss = entity_type_loss + 0.0 * learned_gate.sum()
     
         if torch.isnan(entity_type_loss):
-            entity_type_loss = 0.0 * entity_type_logits.sum() + 0.0 * gate.sum()
+            entity_type_loss = 0.0 * entity_type_logits.sum() + 0.0 * learned_gate.sum()
         
         input_codec_embedding = self.base_model.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
         input_codec_embedding[:, 6, :] = target_speaker_embedding
@@ -211,6 +241,7 @@ class Qwen3TTSModelWithEntityInjection(nn.Module):
             codec_i_embedding = codec_i_embedding * codec_mask.unsqueeze(-1)
             input_embeddings = input_embeddings + codec_i_embedding
 
+        # Always run TTS forward (for DDP), but loss contribution varies by stage
         outputs = self.base_model.talker(
             inputs_embeds=input_embeddings[:, :-1, :],
             attention_mask=attention_mask[:, :-1],
@@ -223,17 +254,27 @@ class Qwen3TTSModelWithEntityInjection(nn.Module):
         talker_codec_ids = codec_ids[codec_mask]
 
         sub_talker_logits, sub_talker_loss = self.base_model.talker.forward_sub_talker_finetune(talker_codec_ids, talker_hidden_states)
-        gate_value = gate.mean()  # Mean of per-token gates for logging
+        
+        gate_value = gate.mean()  # Mean of actual gate used (0 in stage 1, fixed in stage 2a, learned in stage 2b)
+        learned_gate_value = learned_gate.mean()  # Mean of learned gate (for monitoring during all stages)
 
         return {
             'loss': outputs.loss,
             'sub_talker_loss': sub_talker_loss,
             'entity_type_loss': entity_type_loss,
-            "gate_value": gate_value,
-            "target_speaker_embedding": target_speaker_embedding,
+            'gate_value': gate_value,
+            'learned_gate_value': learned_gate_value,
+            'target_speaker_embedding': target_speaker_embedding,
+            'training_stage': training_stage,
         }
 
 def get_optimizer_and_scheduler(model, args, num_epochs, num_batches, accum_grad):
+    """
+    Create optimizer with 3-stage aware learning rates:
+    - Stage 1: Base model LR = 0 (frozen), Entity module trains, Gate LR = 0
+    - Stage 2a: Base model trains, Entity module trains, Gate LR = 0 (frozen at fixed value)
+    - Stage 2b: All modules train with normal LRs
+    """
     base_model = model.base_model
     entity_injection_module = model.entity_injection_module
 
@@ -241,54 +282,61 @@ def get_optimizer_and_scheduler(model, args, num_epochs, num_batches, accum_grad
     entity_params_no_gate = [p for n, p in entity_injection_module.named_parameters() if "gate_proj" not in n]
     gate_proj_params = [p for n, p in entity_injection_module.named_parameters() if "gate_proj" in n]
 
-    entity_lr_multiplier = 10
-    entity_initial_lr = args.lr * entity_lr_multiplier
+    # Learning rates
+    base_lr = args.lr
+    entity_lr = args.lr * 10   # Entity module trains 10x faster
+    gate_lr = args.lr * 5      # Gate trains 5x faster (only in Stage 2b)
 
     optimizer_groups = [
         {
             "params": list(base_model.parameters()),
-            "lr": args.lr,
+            "lr": base_lr,
             "weight_decay": 0.01,
             "name": "base_model",
         },
         {
             "params": entity_params_no_gate,
-            "lr": entity_initial_lr,
+            "lr": entity_lr,
             "weight_decay": 0.01,
             "name": "entity_injection_module",
         },
         {
             "params": gate_proj_params,
-            "lr": entity_initial_lr,
+            "lr": gate_lr,
             "weight_decay": 0.0,
             "name": "entity_injection_gate_proj",
         },
     ]
     optimizer = AdamW(optimizer_groups)
 
-    total_steps = int((num_epochs * num_batches) / accum_grad)
-    warmup_steps = int(total_steps * 0.05)
+    # Stage boundaries from args
+    classifier_warmup_steps = args.classifier_warmup_steps
+    gate_freeze_steps = args.gate_freeze_steps
 
     def lr_lambda_base_model(current_step: int):
+        # Stage 1: Base model frozen (LR = 0)
+        if current_step < classifier_warmup_steps:
+            return 0.0
+        # Stage 2a & 2b: Base model trains
         return 1.0
 
-    def lr_lambda_entity(current_step):
-        if current_step < warmup_steps:
-            ratio = 0.1 + ((1-0.1) / warmup_steps) * current_step
-            return ratio
-        else:
-            decay_steps = total_steps - warmup_steps
-            steps_after_warmup = current_step - warmup_steps
-            target_ratio = args.lr / entity_initial_lr 
-            progress = float(steps_after_warmup) / float(max(1, decay_steps))
-            return target_ratio ** progress
+    def lr_lambda_entity(current_step: int):
+        # Entity module always trains at full LR
+        return 1.0
+    
+    def lr_lambda_gate(current_step: int):
+        # Stage 1 & 2a: Gate doesn't learn (LR = 0)
+        if current_step < gate_freeze_steps:
+            return 0.0
+        # Stage 2b: Gate learns at normal LR
+        return 1.0
     
     scheduler = LambdaLR(
         optimizer,
         lr_lambda=[
             lr_lambda_base_model,
             lr_lambda_entity,
-            lr_lambda_entity,
+            lr_lambda_gate,
         ]
     )
     
@@ -323,8 +371,15 @@ def train():
     parser.add_argument("--num_epochs", type=int, default=3)
     parser.add_argument("--speaker_name", type=str, default="speaker_test")
     parser.add_argument("--entity_loss_weight", type=float, default=0.1)
+    # 3-Stage Training Arguments
     parser.add_argument("--classifier_warmup_steps", type=int, default=0, 
-                        help="Train entity classifier only (no injection into TTS) for this many steps")
+                        help="Stage 1 ends: Train entity classifier only (base frozen, gate=0)")
+    parser.add_argument("--gate_freeze_steps", type=int, default=0,
+                        help="Stage 2a ends: Train with fixed gate until this step")
+    parser.add_argument("--fixed_gate_value", type=float, default=0.1,
+                        help="Fixed gate value during Stage 2a")
+    parser.add_argument("--gate_min", type=float, default=0.05,
+                        help="Minimum gate value during Stage 2b (gate is clamped)")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     # Wandb arguments
     parser.add_argument("--wandb_project", type=str, default="qwen3-tts-entity-injection")
@@ -353,6 +408,11 @@ def train():
             "entity_loss_weight": args.entity_loss_weight,
             "gradient_accumulation_steps": gradient_accumulation_steps,
             "mixed_precision": "bf16",
+            # 3-Stage Training Config
+            "classifier_warmup_steps": args.classifier_warmup_steps,
+            "gate_freeze_steps": args.gate_freeze_steps,
+            "fixed_gate_value": args.fixed_gate_value,
+            "gate_min": args.gate_min,
         },
         init_kwargs={
             "wandb": {
@@ -387,7 +447,7 @@ def train():
     )
     train_dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=dataset.collate_fn)
 
-    # Initialize EntityInjectionModule
+    # Initialize EntityInjectionModule with 3-stage training config
     entity_injection_config = EntityInjectionModuleConfig(
         hidden_size=config.talker_config.text_hidden_size,  # Match text embedding dimension
         num_entities=len(dataset.entity_type_to_index),     # Number of entity types from dataset
@@ -397,7 +457,11 @@ def train():
         dropout=0.1,
         activation="gelu",
         batch_first=True,
-        classifier_warmup_steps=args.classifier_warmup_steps,  # Train classifier only for N steps before injection
+        # 3-Stage Training Config
+        classifier_warmup_steps=args.classifier_warmup_steps,  # End of Stage 1
+        gate_freeze_steps=args.gate_freeze_steps,              # End of Stage 2a
+        fixed_gate_value=args.fixed_gate_value,                # Gate value during Stage 2a
+        gate_min=args.gate_min,                                # Min gate during Stage 2b
     )
     entity_injection_module = EntityInjectionModule(entity_injection_config)
     entity_injection_module = entity_injection_module.to(qwen3tts.model.dtype)
@@ -412,7 +476,7 @@ def train():
     for param in model.base_model.speaker_encoder.parameters():
         param.requires_grad = False
 
-    optimizer, _ = get_optimizer_and_scheduler(model, args, args.num_epochs, len(train_dataloader), gradient_accumulation_steps)
+    optimizer, scheduler = get_optimizer_and_scheduler(model, args, args.num_epochs, len(train_dataloader), gradient_accumulation_steps)
 
     model, optimizer, train_dataloader = accelerator.prepare(
         model, optimizer, train_dataloader
@@ -433,10 +497,27 @@ def train():
     model.train()
 
     if accelerator.is_main_process:
-        if args.classifier_warmup_steps > 0:
-            accelerator.print(f"=== Staged Training: {args.classifier_warmup_steps} warmup steps (classifier only), then full injection ===")
-        else:
-            accelerator.print("=== Full Training: Entity injection from step 0 ===")
+        accelerator.print("=" * 70)
+        accelerator.print("3-STAGE TRAINING CONFIGURATION")
+        accelerator.print("=" * 70)
+        accelerator.print(f"Stage 1 (steps 0 → {args.classifier_warmup_steps}):")
+        accelerator.print(f"  - Base model: FROZEN (LR=0)")
+        accelerator.print(f"  - Entity classifier: TRAINING")
+        accelerator.print(f"  - Gate: 0 (no injection)")
+        accelerator.print(f"  - Loss: Entity classification only contributes to gradients")
+        accelerator.print(f"")
+        accelerator.print(f"Stage 2a (steps {args.classifier_warmup_steps} → {args.gate_freeze_steps}):")
+        accelerator.print(f"  - Base model: TRAINING")
+        accelerator.print(f"  - Entity classifier: TRAINING")
+        accelerator.print(f"  - Gate: FIXED at {args.fixed_gate_value}")
+        accelerator.print(f"  - Loss: TTS + Entity")
+        accelerator.print(f"")
+        accelerator.print(f"Stage 2b (steps {args.gate_freeze_steps}+):")
+        accelerator.print(f"  - Base model: TRAINING")
+        accelerator.print(f"  - Entity classifier: TRAINING")
+        accelerator.print(f"  - Gate: LEARNED (min={args.gate_min})")
+        accelerator.print(f"  - Loss: TTS + Entity")
+        accelerator.print("=" * 70)
 
     step = 0
     for epoch in range(num_epochs):
@@ -467,31 +548,38 @@ def train():
                 optimizer.zero_grad()
                             
                 if accelerator.sync_gradients:
-                    # scheduler.step()
+                    scheduler.step()
                     step += 1
+                    
+                    training_stage = outputs.get('training_stage', 0)
 
-                    # if step % 20 == 0:
-                    #     all_updating, not_updating = check_parameter_changes(
-                    #         accelerator, model, params_before, print_details=True
-                    #     )
-                    #     if not all_updating and accelerator.is_main_process:
-                    #         accelerator.print(f"WARNING: {len(not_updating)} params not updating: {not_updating}")
-
-                    # Log when warmup phase ends
-                    warmup_steps = args.classifier_warmup_steps
-                    if step == warmup_steps and warmup_steps > 0 and accelerator.is_main_process:
-                        accelerator.print(f"=== WARMUP COMPLETE at step {step}: Now injecting entity info into TTS ===")
+                    # Log stage transitions
+                    if step == args.classifier_warmup_steps and args.classifier_warmup_steps > 0 and accelerator.is_main_process:
+                        accelerator.print(f"\n{'='*70}")
+                        accelerator.print(f"STAGE 1 → STAGE 2a at step {step}")
+                        accelerator.print(f"Base model now TRAINING, gate FIXED at {args.fixed_gate_value}")
+                        accelerator.print(f"{'='*70}\n")
+                    
+                    if step == args.gate_freeze_steps and args.gate_freeze_steps > 0 and accelerator.is_main_process:
+                        accelerator.print(f"\n{'='*70}")
+                        accelerator.print(f"STAGE 2a → STAGE 2b at step {step}")
+                        accelerator.print(f"Gate now LEARNING (min={args.gate_min})")
+                        accelerator.print(f"{'='*70}\n")
                     
                     if step % 20 == 0 and accelerator.is_main_process:
-                        current_gate = outputs['gate_value'].item()  # Mean of per-token gates
-                        phase = "WARMUP" if step < warmup_steps else "FULL"
+                        current_gate = outputs['gate_value'].item()
+                        learned_gate = outputs['learned_gate_value'].item()
+                        stage_names = {1: "STAGE1-CLASSIFIER", 2: "STAGE2a-FIXED_GATE", 3: "STAGE2b-LEARN_GATE"}
+                        stage_name = stage_names.get(training_stage, "UNKNOWN")
+                        
                         accelerator.print(
-                            f"[{phase}] Epoch {epoch} | Step {step} | "
+                            f"[{stage_name}] Epoch {epoch} | Step {step} | "
                             f"Loss: {loss.item():.4f} | "
                             f"TTS: {outputs['loss'].item():.4f} | "
                             f"Sub-talker: {outputs['sub_talker_loss'].item():.4f} | "
                             f"Entity: {outputs['entity_type_loss'].item():.4f} | "
-                            f"Gate: {current_gate:.6f}"
+                            f"Gate: {current_gate:.6f} | "
+                            f"LearnedGate: {learned_gate:.6f}"
                         )
                         
                         accelerator.log(
@@ -500,11 +588,14 @@ def train():
                                 "train/tts_loss": outputs["loss"].item(),
                                 "train/sub_talker_loss": outputs["sub_talker_loss"].item(),
                                 "train/entity_type_loss": outputs["entity_type_loss"].item(),
-                                "train/entity_gate": current_gate,
+                                "train/gate_used": current_gate,
+                                "train/gate_learned": learned_gate,
                                 "train/epoch": epoch,
                                 "train/step": step,
+                                "train/lr_base": optimizer.param_groups[0]["lr"],
                                 "train/lr_entity": optimizer.param_groups[1]["lr"],
-                                "train/in_warmup": 1 if step < warmup_steps else 0,  # Track phase in wandb
+                                "train/lr_gate": optimizer.param_groups[2]["lr"],
+                                "train/training_stage": training_stage,
                             },
                             step=step,
                         )
@@ -563,6 +654,13 @@ def train():
                     "dropout": entity_injection_config.dropout,
                     "activation": entity_injection_config.activation,
                     "batch_first": entity_injection_config.batch_first,
+                },
+                "training_config": {
+                    "classifier_warmup_steps": args.classifier_warmup_steps,
+                    "gate_freeze_steps": args.gate_freeze_steps,
+                    "fixed_gate_value": args.fixed_gate_value,
+                    "gate_min": args.gate_min,
+                    "total_steps_trained": step,
                 }
             }
             entity_mapping_path = os.path.join(output_dir, "entity_type_mapping.json")
