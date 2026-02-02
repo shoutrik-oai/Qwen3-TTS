@@ -10,17 +10,26 @@ set -e
 
 # Model paths
 INIT_MODEL_PATH="/speech/arjun/.cache/huggingface/hub/models--Qwen--Qwen3-TTS-12Hz-0.6B-Base/snapshots/5d83992436eae1d760afd27aff78a71d676296fc"
-OUTPUT_MODEL_PATH="./output/entity_injection_v3"
+OUTPUT_MODEL_PATH="./output/entity_injection_v4"
 
 # Data
-TRAIN_JSONL="/speech/arjun/shoutrik/DATA/qwen/metadata.jsonl"
+TRAIN_JSONL="/speech/arjun/shoutrik/DATA/metadata_with_entities.jsonl"
 
 # Training hyperparameters
 BATCH_SIZE=16
 LEARNING_RATE=1e-5
 NUM_EPOCHS=20
-ENTITY_LOSS_WEIGHT=0.1
+ENTITY_LOSS_WEIGHT=0.5
 GRADIENT_ACCUMULATION_STEPS=4
+
+# 3-Stage Training Configuration
+# Stage 1 (0 → CLASSIFIER_WARMUP_STEPS): Base frozen, entity classifier only, gate=0
+# Stage 2a (CLASSIFIER_WARMUP_STEPS → GATE_FREEZE_STEPS): Full training, gate=FIXED_GATE_VALUE
+# Stage 2b (GATE_FREEZE_STEPS+): Full training, gate=learned with min clamp
+CLASSIFIER_WARMUP_STEPS=5000   # End of Stage 1: classifier-only training
+GATE_FREEZE_STEPS=15000        # End of Stage 2a: gate becomes learnable after this
+FIXED_GATE_VALUE=0.1           # Fixed gate value during Stage 2a
+GATE_MIN=0.05                  # Minimum gate value during Stage 2b (clamped)
 
 # Speaker
 SPEAKER_NAME="speaker_test"
@@ -42,7 +51,7 @@ fi
 ACCELERATE_CONFIG="/speech/arjun/shoutrik/Qwen3-TTS/finetuning/default_config.yaml"
 
 # GPU settings
-export CUDA_VISIBLE_DEVICES=0,1,2,3  # Change to "0,1" for multi-GPU
+export CUDA_VISIBLE_DEVICES=2,3,4  # Change to "0,1" for multi-GPU
 
 # ============================================================================
 # Parse command line arguments
@@ -80,6 +89,22 @@ while [[ $# -gt 0 ]]; do
             ;;
         --wandb_run)
             WANDB_RUN_NAME="$2"
+            shift 2
+            ;;
+        --classifier_warmup_steps)
+            CLASSIFIER_WARMUP_STEPS="$2"
+            shift 2
+            ;;
+        --gate_freeze_steps)
+            GATE_FREEZE_STEPS="$2"
+            shift 2
+            ;;
+        --fixed_gate_value)
+            FIXED_GATE_VALUE="$2"
+            shift 2
+            ;;
+        --gate_min)
+            GATE_MIN="$2"
             shift 2
             ;;
         *)
@@ -125,6 +150,11 @@ echo "  Learning rate:  $LEARNING_RATE"
 echo "  Epochs:         $NUM_EPOCHS"
 echo "  Entity loss:    $ENTITY_LOSS_WEIGHT"
 echo ""
+echo "3-Stage Training:"
+echo "  Stage 1 (0 → $CLASSIFIER_WARMUP_STEPS): Classifier only, base frozen, gate=0"
+echo "  Stage 2a ($CLASSIFIER_WARMUP_STEPS → $GATE_FREEZE_STEPS): Full training, gate=$FIXED_GATE_VALUE (fixed)"
+echo "  Stage 2b ($GATE_FREEZE_STEPS+): Full training, gate=learned (min=$GATE_MIN)"
+echo ""
 echo "Wandb:"
 echo "  Project:        $WANDB_PROJECT"
 echo "  Run name:       $WANDB_RUN_NAME"
@@ -156,7 +186,7 @@ else
 fi
 export TORCH_DISTRIBUTED_DEBUG=DETAIL
 
-$ACCELERATE_CMD "sft_12hz_with_EntityInjection.py" \
+$ACCELERATE_CMD "sft_12hz_with_EntityInjection_v4.py" \
     --init_model_path "$INIT_MODEL_PATH" \
     --output_model_path "$OUTPUT_MODEL_PATH" \
     --train_jsonl "$TRAIN_JSONL" \
@@ -165,6 +195,10 @@ $ACCELERATE_CMD "sft_12hz_with_EntityInjection.py" \
     --num_epochs "$NUM_EPOCHS" \
     --speaker_name "$SPEAKER_NAME" \
     --entity_loss_weight "$ENTITY_LOSS_WEIGHT" \
+    --classifier_warmup_steps "$CLASSIFIER_WARMUP_STEPS" \
+    --gate_freeze_steps "$GATE_FREEZE_STEPS" \
+    --fixed_gate_value "$FIXED_GATE_VALUE" \
+    --gate_min "$GATE_MIN" \
     --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS" \
     --wandb_project "$WANDB_PROJECT" \
     --wandb_run_name "$WANDB_RUN_NAME"
