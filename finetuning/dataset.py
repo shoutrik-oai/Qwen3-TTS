@@ -13,7 +13,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Any, List, Tuple, Union
+from typing import Any, List, Tuple, Union, Optional
+import os
 
 import librosa
 import numpy as np
@@ -25,6 +26,8 @@ from torch.utils.data import Dataset, DataLoader
 import torch.nn.functional as F
 import json
 from transformers import AutoConfig
+from tqdm import tqdm
+from datasets import load_from_disk, concatenate_datasets
 
 AudioLike = Union[
     str,                     # wav path, URL, base64
@@ -35,23 +38,81 @@ AudioLike = Union[
 MaybeList = Union[Any, List[Any]]
 
 class TTSDataset(Dataset):
-    def __init__(self, data_list, processor, config:Qwen3TTSConfig, lag_num = -1):
-        self.data_list = data_list
+    def __init__(
+        self, 
+        dataset_paths: dict, 
+        processor, 
+        config: Qwen3TTSConfig, 
+        codec_name: str = "qwen3_12hz",
+        lag_num: int = -1
+    ):
+        """
+        Args:
+            dataset_paths: Dict mapping dataset name to HuggingFace dataset path
+                          e.g. {"hifi": "/path/to/hifi_dataset", "google_tn": "/path/to/google_tn"}
+            processor: Qwen3TTS processor
+            config: Qwen3TTSConfig
+            codec_name: Name of the codec (used to find audio_codes_{codec_name} column)
+            lag_num: Lag number for training
+        """
         self.processor = processor
         self.lag_num = lag_num
         self.config = config
-        self.special_types = ["SPECIAL", "PLAIN_WORD"]
+        self.codec_column = f"audio_codes_{codec_name}"
+        self.special_types = ["SPECIAL", "PLAIN_WORD", "PLAIN"]
 
         assert self.processor.tokenizer.is_fast, "Processor must be a fast tokenizer"
 
-        # Build entity type vocabulary with required base types
-        entity_types = set([entity["type"] for line in data_list for entity in line["entities"]])
+        print("Loading datasets...")
+        datasets_list = []
+        for dataset_name, dataset_path in dataset_paths.items():
+            print(f"  Loading {dataset_name} from {dataset_path}...")
+            dataset = load_from_disk(dataset_path)
+            dataset = dataset.map(
+                lambda x: {"dataset_root": dataset_path},
+                desc=f"Adding root to {dataset_name}"
+            )
+            datasets_list.append(dataset)
+            print(f"    Loaded {len(dataset)} samples")
+        
+        self.data_list = concatenate_datasets(datasets_list)
+        print(f"Total samples after concatenation: {len(self.data_list)}")
+        self.data_list = self.data_list.shuffle(seed=42)
+        # self.data_list = self.data_list.select(range(2000))
+
+        # drop samples with duration more than 30 seconds and less than 2 seconds
+        self.data_list = self.data_list.filter(lambda x: x['audio_duration'] > 2 and x['audio_duration'] < 30)
+        print(f"Total samples after filtering for duration between 2 and 30 seconds: {len(self.data_list)}")
+
+        print("Building entity type vocabulary and speaker map from dataset...")
+        entity_types = set()
+        self.speaker_map = {}
+        for sample in tqdm(self.data_list, desc="Scanning samples"):
+            entities = sample.get("entities", [])
+            for entity in entities:
+                entity_types.add(entity["type"])
+            speaker = sample.get("speaker", "")
+            if speaker and speaker not in self.speaker_map:
+                reference_audio_path = sample.get("reference_audio_path", "")
+                root = sample.get("dataset_root", "")
+                if reference_audio_path:
+                    reference_audio_path = os.path.join(root, reference_audio_path)
+                    wav, sr = self._load_audio_to_np(reference_audio_path)
+                    wav = self._normalize(wav)
+                    ref_mel = self.extract_mels(audio=wav, sr=sr)
+                    self.speaker_map[speaker] = ref_mel
+
         for special_type in self.special_types:
-            if special_type not in entity_types:
-                entity_types.add(special_type)
+            entity_types.add(special_type)
+        
         entity_types = sorted(list(entity_types))
         self.entity_type_to_index = {entity_type: i for i, entity_type in enumerate(entity_types)}
         self.index_to_entity_type = {v: k for k, v in self.entity_type_to_index.items()}
+        print(f"Found {len(entity_types)} entity types: {entity_types}")
+
+        speaker_map = dict(sorted(self.speaker_map.items(), key=lambda x: x[0]))
+        print(f"Found {len(self.speaker_map)} speakers: {list(self.speaker_map.keys())}")
+
 
     def __len__(self):
         return len(self.data_list)
@@ -66,6 +127,12 @@ class TTSDataset(Dataset):
             audio = np.mean(audio, axis=-1)
 
         return audio.astype(np.float32), 24000
+    
+    def _normalize(self, audio: np.ndarray) -> np.ndarray:
+        max_val = np.abs(audio).max()
+        if max_val > 1.0:
+            audio = audio / max_val
+        return audio
 
     def _normalize_audio_inputs(self, audios: Union[AudioLike, List[AudioLike]]) -> List[Tuple[np.ndarray, int]]:
         """
@@ -164,20 +231,27 @@ class TTSDataset(Dataset):
         token_label_ids = [self.entity_type_to_index.get(label, plain_idx) for label in token_labels]
         return token_labels, token_label_ids
 
+    def _resolve_path(self, relative_path: str, dataset_root: str) -> str:
+        """Resolve a relative path to an absolute path using dataset_root."""
+        if os.path.isabs(relative_path):
+            return relative_path
+        return os.path.join(dataset_root, relative_path)
+
     def __getitem__(self, idx):
         item = self.data_list[idx]
+        
+        dataset_root = item["dataset_root"]
+        audio_path = item["audio_path"]
+        audio_path = self._resolve_path(audio_path, dataset_root)
+        text = item["written_text"]
+        audio_codes = item[self.codec_column]
+        
+        language = item.get('language', 'Auto')
+        ref_audio_path = item["reference_audio_path"]
+        ref_audio_path = self._resolve_path(ref_audio_path, dataset_root)
+        entities = item.get('entities', [])
 
-        audio_path  = item["audio"]
-        text        = item["text"]
-        audio_codes = item["audio_codes"]
-        language        = item.get('language','Auto')
-        ref_audio_path  = item['ref_audio']
-        entities        = item['entities']
-
-        # print(f"text: {text}")
         text = self._build_assistant_text(text)
-        # print(f"text after build: {text}")
-
         text_ids, offsets = self._tokenize_texts(text)
         text_ids = text_ids[:,:-5]
         offsets = offsets[0, 3:-5] if offsets.dim() == 3 else offsets[3:-5]
@@ -189,11 +263,8 @@ class TTSDataset(Dataset):
 
         audio_codes = torch.tensor(audio_codes, dtype=torch.long)
 
-        ref_audio_list = self._ensure_list(ref_audio_path)
-        normalized = self._normalize_audio_inputs(ref_audio_list)
-        wav,sr = normalized[0]
-
-        ref_mel = self.extract_mels(audio=wav, sr=sr)
+        speaker = item.get("speaker", "")
+        ref_mel = self.speaker_map.get(speaker, None)
         # print(f"length of text : {len(text_ids[0, 3:])}")
         # print(f"length of entity labels : {len(entity_label_ids)}")
         # print(f"text : {self.processor.tokenizer.decode(text_ids[0, 3:])}")
