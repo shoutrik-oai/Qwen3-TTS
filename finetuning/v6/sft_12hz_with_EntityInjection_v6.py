@@ -24,6 +24,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import argparse
 import json
+import math
 import os
 import shutil
 import warnings
@@ -38,7 +39,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import wandb
 from accelerate import Accelerator
-from dataset import TTSDataset
+from dataset import TTSDataset, DistributedMixedSourceBatchSampler
 from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
 from safetensors.torch import save_file
 from torch.optim import AdamW
@@ -48,6 +49,7 @@ from dataclasses import dataclass
 from torch.optim.lr_scheduler import LambdaLR
 from accelerate.utils import DistributedDataParallelKwargs
 from transformers import AutoModel, AutoConfig as HFAutoConfig
+# from peft import LoraConfig, get_peft_model
 
 
 @dataclass
@@ -55,47 +57,30 @@ class EntityInjectionModuleConfig:
     hidden_size: int  # Qwen's text hidden size
     num_entities: int
     # Pretrained encoder settings
-    pretrained_encoder: str = "distilbert-base-uncased"  # or "bert-base-uncased", "prajjwal1/bert-tiny", etc.
-    freeze_encoder: bool = False  # If True, only train projections + FiLM
-    # Fallback to scratch training if pretrained_encoder is None
     num_layers: int = 2
     num_heads: int = 8
     dim_feedforward: int = 2048
     dropout: float = 0.1
+    entity_prob: float = 0.0
 
 
 class FiLMLayer(nn.Module):
-    """
-    Feature-wise Linear Modulation (FiLM) layer.
-    Applies: H_out = gamma * H_in + beta
-    
-    Unlike gating (H + g*delta), FiLM can't collapse to identity.
-    gamma ≈ 1, beta ≈ 0 initially, but always structurally modifies H.
-    """
-    
     def __init__(self, hidden_size, num_entities):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_entities = num_entities
         
-        # Learnable entity type embeddings
         self.entity_type_embeddings = nn.Embedding(num_entities, hidden_size)
-        
-        # MLP to generate gamma and beta from entity embedding
         self.film_mlp = nn.Sequential(
             nn.Linear(hidden_size, hidden_size * 2),
             nn.GELU(),
-            nn.Linear(hidden_size * 2, hidden_size * 2),  # outputs [gamma_offset, beta]
+            nn.Linear(hidden_size * 2, hidden_size * 2),
         )
         
         self._init_weights()
     
     def _init_weights(self):
-        # Initialize entity embeddings
         nn.init.normal_(self.entity_type_embeddings.weight, std=0.02)
-        
-        # Initialize MLP - crucial for near-identity initialization
-        # The final layer should output near-zero so gamma ≈ 1, beta ≈ 0
         for module in self.film_mlp:
             if isinstance(module, nn.Linear):
                 nn.init.normal_(module.weight, std=0.02)
@@ -105,20 +90,8 @@ class FiLMLayer(nn.Module):
         final_layer = self.film_mlp[-1]
         nn.init.normal_(final_layer.weight, std=0.001)
         nn.init.zeros_(final_layer.bias)
-    
+
     def forward(self, hidden_states, entity_logits, temperature=1.0):
-        """
-        Args:
-            hidden_states: [B, T, D] - text hidden states to condition
-            entity_logits: [B, T, num_entities] - predicted entity type logits
-            temperature: softmax temperature (lower = sharper)
-            
-        Returns:
-            conditioned: [B, T, D] - FiLM-conditioned hidden states
-            gamma: [B, T, D] - scale factors (for logging)
-            beta: [B, T, D] - shift factors (for logging)
-        """
-        # Soft entity type embedding via attention over entity types
         type_probs = F.softmax(entity_logits / temperature, dim=-1)  # [B, T, num_entities]
         type_emb = type_probs @ self.entity_type_embeddings.weight   # [B, T, D]
         
@@ -135,159 +108,88 @@ class FiLMLayer(nn.Module):
         
         return conditioned, gamma, beta
 
+class SinusoidalPositionalEmbedding(nn.Module):
+    def __init__(self, d_model, max_len=2048):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe.unsqueeze(0))
+    
+    def forward(self, x):
+        return x + self.pe[:, :x.size(1)]
+
 
 class EntityInjectionModule(nn.Module):
-    """
-    Entity-aware conditioning using FiLM (Feature-wise Linear Modulation).
-    
-    Architecture:
-        1. Entity Encoder: Pretrained BERT/DistilBERT (finetuned with low LR)
-           - Input projection: Qwen hidden → BERT hidden
-           - Output projection: BERT hidden → Qwen hidden
-        2. Entity Head: Predicts entity types per token (trained from scratch)
-        3. FiLM Layer: Conditions embeddings using soft entity predictions (trained from scratch)
-    
-    Key difference from gate-based approach:
-        - Gate: H + g * delta → can collapse (g → 0)
-        - FiLM: γ * H + β → structurally always modifies H (γ ≈ 1)
-    
-    Input:
-        text_embeddings: [B, T, D] - text token embeddings
-        text_mask: [B, T] - 1 for valid text positions, 0 for padding
-        
-    Output:
-        conditioned: [B, T, D] - entity-conditioned embeddings
-        entity_logits: [B, T, num_entities] - entity type predictions
-    """
-    
     def __init__(self, config: EntityInjectionModuleConfig):
         super().__init__()
         
         qwen_hidden_size = config.hidden_size
         num_entities = config.num_entities
         self.num_entities = num_entities
-        self.use_pretrained = config.pretrained_encoder is not None
+
+        self.positional_embedding = SinusoidalPositionalEmbedding(config.hidden_size)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=qwen_hidden_size,
+            nhead=config.num_heads,
+            dim_feedforward=config.dim_feedforward,
+            dropout=config.dropout,
+            activation="gelu",
+            batch_first=True
+        )
+        self.entity_encoder = nn.TransformerEncoder(encoder_layer, num_layers=config.num_layers)
+        encoder_output_dim = qwen_hidden_size
         
-        if self.use_pretrained:
-            # Load pretrained encoder (e.g., DistilBERT, BERT-tiny)
-            print(f"Loading pretrained encoder: {config.pretrained_encoder}")
-            self.pretrained_encoder = AutoModel.from_pretrained(config.pretrained_encoder)
-            bert_hidden_size = self.pretrained_encoder.config.hidden_size
-            
-            # Projection layers: Qwen hidden <-> BERT hidden
-            self.input_proj = nn.Linear(qwen_hidden_size, bert_hidden_size)
-            self.output_proj = nn.Linear(bert_hidden_size, qwen_hidden_size)
-            
-            # Optionally freeze the pretrained encoder
-            if config.freeze_encoder:
-                print("Freezing pretrained encoder weights")
-                for param in self.pretrained_encoder.parameters():
-                    param.requires_grad = False
-            
-            # Output dimension for entity head
-            encoder_output_dim = qwen_hidden_size
-        else:
-            # Fallback: train entity encoder from scratch
-            print("Training entity encoder from scratch")
-            encoder_layer = nn.TransformerEncoderLayer(
-                d_model=qwen_hidden_size,
-                nhead=config.num_heads,
-                dim_feedforward=config.dim_feedforward,
-                dropout=config.dropout,
-                activation="gelu",
-                batch_first=True
-            )
-            self.entity_encoder = nn.TransformerEncoder(encoder_layer, num_layers=config.num_layers)
-            self.input_proj = None
-            self.output_proj = None
-            encoder_output_dim = qwen_hidden_size
-        
-        # Entity type classification head (trained from scratch)
         self.entity_head = nn.Linear(encoder_output_dim, num_entities)
-        
-        # FiLM conditioning layer (trained from scratch)
+        self.entity_detector = nn.Linear(encoder_output_dim, 1)
         self.film_layer = FiLMLayer(qwen_hidden_size, num_entities)
+        self.config = config
         
         self._init_weights()
     
     def _init_weights(self):
         nn.init.xavier_uniform_(self.entity_head.weight)
         nn.init.zeros_(self.entity_head.bias)
-        
-        if self.input_proj is not None:
-            nn.init.xavier_uniform_(self.input_proj.weight)
-            nn.init.zeros_(self.input_proj.bias)
-        if self.output_proj is not None:
-            nn.init.xavier_uniform_(self.output_proj.weight)
-            nn.init.zeros_(self.output_proj.bias)
+        nn.init.xavier_uniform_(self.entity_detector.weight)
+        prior_prob = max(self.config.entity_prob, 1e-6)  # Clamp to avoid div by zero
+        bias_init = math.log(prior_prob / (1 - prior_prob))
+        nn.init.constant_(self.entity_detector.bias, bias_init)
     
     def forward(self, text_embeddings, text_mask=None, return_details=False):
-        """
-        Two-stage forward pass:
-            Stage 1: Entity prediction from text embeddings (via pretrained encoder)
-            Stage 2: FiLM conditioning using entity predictions
-        
-        Args:
-            text_embeddings: [B, T, D] text token embeddings from Qwen
-            text_mask: [B, T] attention mask (1 = valid, 0 = padding)
-            return_details: whether to return additional info for logging/loss
-            
-        Returns:
-            conditioned: [B, T, D] entity-conditioned embeddings
-            entity_logits: [B, T, num_entities] entity type predictions
-            (gamma, beta): FiLM parameters if return_details=True
-        """
-        if self.use_pretrained:
-            # ===== PRETRAINED ENCODER PATH =====
-            # Project Qwen embeddings to BERT dimension
-            projected = self.input_proj(text_embeddings)  # [B, T, D_bert]
-            
-            # Create attention mask for BERT (1 = attend, 0 = ignore)
-            if text_mask is not None:
-                attention_mask = text_mask.long()
-            else:
-                attention_mask = torch.ones(text_embeddings.shape[:2], device=text_embeddings.device)
-            
-            # Pass through pretrained encoder
-            # BERT/DistilBERT expects attention_mask where 1 = attend
-            encoder_outputs = self.pretrained_encoder(
-                inputs_embeds=projected,
-                attention_mask=attention_mask,
-                return_dict=True
-            )
-            entity_hidden_bert = encoder_outputs.last_hidden_state  # [B, T, D_bert]
-            
-            # Project back to Qwen dimension
-            entity_hidden = self.output_proj(entity_hidden_bert)  # [B, T, D_qwen]
+        if text_mask is not None:
+            src_key_padding_mask = (text_mask == 0)
         else:
-            # ===== SCRATCH ENCODER PATH =====
-            if text_mask is not None:
-                src_key_padding_mask = (text_mask == 0)
-            else:
-                src_key_padding_mask = None
-            
-            entity_hidden = self.entity_encoder(text_embeddings, src_key_padding_mask=src_key_padding_mask)
-        
-        # ===== STAGE 1: Entity Prediction =====
-        entity_logits = self.entity_head(entity_hidden)  # [B, T, num_entities]
-        
-        # ===== STAGE 2: FiLM Conditioning =====
-        # Apply FiLM using soft entity predictions
-        conditioned, gamma, beta = self.film_layer(entity_hidden, entity_logits)
+            src_key_padding_mask = None
+
+        text_embeddings = self.positional_embedding(text_embeddings)
+        entity_hidden = self.entity_encoder(text_embeddings, src_key_padding_mask=src_key_padding_mask)
+
+        entity_logits = self.entity_head(entity_hidden) 
+        entity_detection_logits = self.entity_detector(entity_hidden)
+        is_entity = torch.sigmoid(entity_detection_logits)
+
+        conditioned, gamma, beta = self.film_layer(text_embeddings, entity_logits)
+
+        conditioned = text_embeddings * (1 - is_entity) + conditioned * is_entity
         
         if return_details:
-            return conditioned, entity_logits, gamma, beta
+            return conditioned, entity_logits, entity_detection_logits, gamma, beta
         
-        return conditioned, entity_logits
+        return conditioned, entity_logits, entity_detection_logits
 
 
 class Qwen3TTSModelWithEntityInjection(nn.Module):
-    def __init__(self, base_model, qwen3_config, entity_injection_module, special_indices):
+    def __init__(self, base_model, qwen3_config, entity_injection_module, special_indices, special_index, entity_prob):
         super().__init__()
         self.base_model = base_model
         self.qwen3_config = qwen3_config
         self.entity_injection_module = entity_injection_module
         self.special_indices = special_indices
+        self.special_index = special_index
+        self.entity_prob = entity_prob
         
     def forward(self, batch):
         input_ids = batch['input_ids']
@@ -309,49 +211,43 @@ class Qwen3TTSModelWithEntityInjection(nn.Module):
         input_text_embedding = self.base_model.talker.model.text_embedding(input_text_ids) * text_embedding_mask
         text_only_mask = batch['text_only_mask']
         
-        # ===== Entity Injection with FiLM =====
-        # Two-stage: 1) Predict entities, 2) Condition with FiLM
-        conditioned_embedding, entity_logits, gamma, beta = self.entity_injection_module(
+        conditioned_embedding, entity_logits, entity_detection_logits, gamma, beta = self.entity_injection_module(
             input_text_embedding, 
             text_mask=text_only_mask.long(),
             return_details=True
         )
         
-        # Continue through text projection
         conditioned_embedding = conditioned_embedding.to(torch.bfloat16)
         input_text_embedding = self.base_model.talker.text_projection(conditioned_embedding)
 
-        # ===== Entity Loss =====
         entity_labels = entities[:, :, 0].clone()  # [B, T]
+
+        positions_valid_for_entity_detection = (entity_labels != -100) & text_only_mask
         
-        # Mask out special indices (SPECIAL, PLAIN_WORD, PLAIN) - ignore them
         special_mask = torch.isin(entity_labels, self.special_indices.to(entity_labels.device))
-        entity_labels[special_mask] = -100
+        is_entity_labels = ~special_mask
+
+        entity_labels_for_type = entity_labels.clone()
+        entity_labels_for_type[special_mask] = -100
         
         entity_type_loss = F.cross_entropy(
             entity_logits.view(-1, entity_logits.size(-1)),
-            entity_labels.view(-1),
+            entity_labels_for_type.view(-1),
             ignore_index=-100,
         )
+        pos_weight = torch.tensor((1 - self.entity_prob) / self.entity_prob, device=entity_detection_logits.device)
+        entity_detection_loss = F.binary_cross_entropy_with_logits(
+            entity_detection_logits[positions_valid_for_entity_detection].view(-1),
+            is_entity_labels[positions_valid_for_entity_detection].float().view(-1),
+            pos_weight=pos_weight,
+        )
         
-        # DDP FIX: Ensure ALL parameters participate in loss computation
-        # Include gamma, beta sums with 0 coefficient to keep FiLM layer in graph
-        # This ensures entity_type_embeddings and film_mlp always receive gradients
-        entity_type_loss = entity_type_loss + 0.0 * gamma.sum() + 0.0 * beta.sum()
-        
-        # DDP FIX: When using inputs_embeds, BERT's word_embeddings are bypassed
-        # Add dummy term to ensure word_embeddings weights participate in gradient computation
-        if hasattr(self.entity_injection_module, 'pretrained_encoder'):
-            # For DistilBERT/BERT, the word embeddings are at embeddings.word_embeddings
-            word_emb_weight = self.entity_injection_module.pretrained_encoder.embeddings.word_embeddings.weight
-            entity_type_loss = entity_type_loss + 0.0 * word_emb_weight.sum()
-    
         if torch.isnan(entity_type_loss):
             entity_type_loss = 0.0 * entity_logits.sum() + 0.0 * gamma.sum() + 0.0 * beta.sum()
-            # Also include word_embeddings in NaN fallback for DDP
-            if hasattr(self.entity_injection_module, 'pretrained_encoder'):
-                word_emb_weight = self.entity_injection_module.pretrained_encoder.embeddings.word_embeddings.weight
-                entity_type_loss = entity_type_loss + 0.0 * word_emb_weight.sum()
+        else:
+            entity_type_loss = entity_type_loss + 0.0 * gamma.sum() + 0.0 * beta.sum()
+        
+        entity_loss = entity_type_loss + entity_detection_loss
         
         # ===== Continue with TTS Forward =====
         input_codec_embedding = self.base_model.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
@@ -385,42 +281,31 @@ class Qwen3TTSModelWithEntityInjection(nn.Module):
             'loss': outputs.loss,
             'sub_talker_loss': sub_talker_loss,
             'entity_type_loss': entity_type_loss,
+            'entity_detection_loss': entity_detection_loss,
+            'entity_loss': entity_loss,
             'gamma_mean': gamma_mean,
             'beta_mean': beta_mean,
             'target_speaker_embedding': target_speaker_embedding,
         }
 
 def get_optimizer_and_scheduler(model, args, num_epochs, num_batches, accum_grad):
-    """
-    Optimizer for FiLM-based entity injection with pretrained encoder.
-    
-    Parameter groups:
-        1. Base TTS model - base LR
-        2. Pretrained encoder (BERT/DistilBERT) - very low LR (0.1x base)
-        3. Projection layers - higher LR (10x base)
-        4. Entity head - higher LR (10x base)
-        5. FiLM layer - higher LR (10x base)
-    """
     base_model = model.base_model
     entity_module = model.entity_injection_module
 
     # Categorize parameters
-    pretrained_encoder_params = []
     projection_params = []
     entity_head_params = []
+    entity_detector_params = []
     film_layer_params = []
     scratch_encoder_params = []
     
     for name, param in entity_module.named_parameters():
         if not param.requires_grad:
-            continue  # Skip frozen params
-        
-        if "pretrained_encoder" in name:
-            pretrained_encoder_params.append(param)
-        elif "input_proj" in name or "output_proj" in name:
-            projection_params.append(param)
+            continue
         elif "entity_head" in name:
             entity_head_params.append(param)
+        elif "entity_detector" in name:
+            entity_detector_params.append(param)
         elif "film_layer" in name:
             film_layer_params.append(param)
         elif "entity_encoder" in name:
@@ -428,8 +313,7 @@ def get_optimizer_and_scheduler(model, args, num_epochs, num_batches, accum_grad
 
     # Learning rates
     base_lr = args.lr
-    pretrained_lr = args.lr * 0.1   # Very low LR for pretrained (finetune gently)
-    new_module_lr = args.lr * 10    # Higher LR for new modules (train from scratch)
+    new_module_lr = args.lr * 100    # Higher LR for new modules (train from scratch)
 
     optimizer_groups = [
         {
@@ -440,16 +324,6 @@ def get_optimizer_and_scheduler(model, args, num_epochs, num_batches, accum_grad
         },
     ]
     
-    # Add pretrained encoder params (if any) with low LR
-    if pretrained_encoder_params:
-        optimizer_groups.append({
-            "params": pretrained_encoder_params,
-            "lr": pretrained_lr,
-            "weight_decay": 0.01,
-            "name": "pretrained_encoder",
-        })
-    
-    # Add scratch encoder params (if any) with high LR
     if scratch_encoder_params:
         optimizer_groups.append({
             "params": scratch_encoder_params,
@@ -467,7 +341,6 @@ def get_optimizer_and_scheduler(model, args, num_epochs, num_batches, accum_grad
             "name": "projections",
         })
     
-    # Add entity head params with high LR
     if entity_head_params:
         optimizer_groups.append({
             "params": entity_head_params,
@@ -476,7 +349,14 @@ def get_optimizer_and_scheduler(model, args, num_epochs, num_batches, accum_grad
             "name": "entity_head",
         })
     
-    # Add FiLM layer params with high LR
+    if entity_detector_params:
+        optimizer_groups.append({
+            "params": entity_detector_params,
+            "lr": new_module_lr,
+            "weight_decay": 0.01,
+            "name": "entity_detector",
+        })
+    
     if film_layer_params:
         optimizer_groups.append({
             "params": film_layer_params,
@@ -526,12 +406,6 @@ def train():
     parser.add_argument("--speaker_name", type=str, default="speaker_test")
     parser.add_argument("--entity_loss_weight", type=float, default=0.1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
-    # Pretrained encoder settings
-    parser.add_argument("--pretrained_encoder", type=str, default="distilbert-base-uncased",
-                        help="Pretrained encoder for entity detection. Options: distilbert-base-uncased, "
-                             "prajjwal1/bert-tiny, prajjwal1/bert-mini, bert-base-uncased, or 'none' for scratch")
-    parser.add_argument("--freeze_encoder", action="store_true",
-                        help="Freeze pretrained encoder weights (only train projections + FiLM)")
     # Wandb arguments
     parser.add_argument("--wandb_project", type=str, default="qwen3-tts-entity-injection")
     parser.add_argument("--wandb_run_name", type=str, default=None)
@@ -559,8 +433,6 @@ def train():
             "entity_loss_weight": args.entity_loss_weight,
             "gradient_accumulation_steps": gradient_accumulation_steps,
             "mixed_precision": "bf16",
-            "pretrained_encoder": args.pretrained_encoder,
-            "freeze_encoder": args.freeze_encoder,
         },
         init_kwargs={
             "wandb": {
@@ -582,9 +454,11 @@ def train():
 
     # Dataset paths - fill in with actual paths to HuggingFace datasets
     HF_datasets = {
-        "hifi": "/speech/arjun/shoutrik/DATA/HiFi",        # TODO: Set actual path
-        "GoogleTNLarge": "/speech/arjun/shoutrik/DATA/GoogleTNLarge",  # TODO: Set actual path
-        "TextNormalisationSyntheticData": "/speech/arjun/shoutrik/DATA/TextNormalisationSyntheticData",          # TODO: Set actual path
+        "hifi": "/speech/arjun/shoutrik/DATA/HF_datasets/HiFi",        # TODO: Set actual path
+        "GoogleTNLarge": "/speech/arjun/shoutrik/DATA/HF_datasets/GoogleTN_V1",  # TODO: Set actual path
+        "GoogleTNLarge_v2": "/speech/arjun/shoutrik/DATA/HF_datasets/GoogleTN_V2",
+        "TextNormalisationSyntheticData": "/speech/arjun/shoutrik/DATA/HF_datasets/TextNormOnlyAllTypes",
+        "TextNormalisationSyntheticDataOnlyNumbers": "/speech/arjun/shoutrik/DATA/HF_datasets/TextNormOnlyNumbers",          # TODO: Set actual path
     }
 
     dataset = TTSDataset(
@@ -593,38 +467,30 @@ def train():
         config=config,
         codec_name="qwen3_12hz",
     )
-    train_dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=dataset.collate_fn)
+    sampler = DistributedMixedSourceBatchSampler(dataset, args.batch_size, num_replicas=accelerator.num_processes, rank=accelerator.process_index, shuffle=True)
+    train_dataloader = DataLoader(dataset, batch_sampler=sampler, collate_fn=dataset.collate_fn)
 
-    # Initialize EntityInjectionModule with pretrained encoder
-    # Options: "distilbert-base-uncased", "prajjwal1/bert-tiny", "prajjwal1/bert-mini", None (scratch)
-    pretrained_encoder = args.pretrained_encoder if args.pretrained_encoder.lower() != "none" else None
-    
-    if accelerator.is_main_process:
-        if pretrained_encoder:
-            accelerator.print(f"Using pretrained encoder: {pretrained_encoder}")
-            accelerator.print(f"  Freeze encoder: {args.freeze_encoder}")
-        else:
-            accelerator.print("Training entity encoder from scratch")
+    n_entities = dataset.n_entities
+    n_tokens = dataset.n_tokens
+    entity_prob = n_entities / n_tokens
     
     entity_injection_config = EntityInjectionModuleConfig(
         hidden_size=config.talker_config.text_hidden_size,  # Qwen's text hidden dimension
-        num_entities=len(dataset.entity_type_to_index),     # Number of entity types from dataset
-        pretrained_encoder=pretrained_encoder,              # e.g., "distilbert-base-uncased" or None
-        freeze_encoder=args.freeze_encoder,                 # Whether to freeze pretrained weights
-        # Fallback settings if pretrained_encoder is None:
+        num_entities=len(dataset.entity_type_to_index),     # Number of entity types from dataset          # e.g., "distilbert-base-uncased" or None              # Whether to freeze pretrained weights
         num_layers=2,
         num_heads=8,
         dim_feedforward=config.talker_config.text_hidden_size * 4,
         dropout=0.1,
+        entity_prob=entity_prob,
     )
     entity_injection_module = EntityInjectionModule(entity_injection_config)
     entity_injection_module = entity_injection_module.to(qwen3tts.model.dtype)
     
-    # Special entity types that should be ignored in loss
     special_entities = dataset.special_types
     special_indices = torch.tensor([dataset.entity_type_to_index[t] for t in special_entities])
+    special_index = dataset.entity_type_to_index["SPECIAL"]
 
-    model = Qwen3TTSModelWithEntityInjection(qwen3tts.model, config, entity_injection_module, special_indices).to(accelerator.device)
+    model = Qwen3TTSModelWithEntityInjection(qwen3tts.model, config, entity_injection_module, special_indices, special_index, entity_prob).to(accelerator.device)
     for param in model.base_model.speaker_encoder.parameters():
         param.requires_grad = False
 
@@ -633,17 +499,6 @@ def train():
     model, optimizer, scheduler, train_dataloader = accelerator.prepare(
         model, optimizer, scheduler, train_dataloader
     )
-
-
-    # unwrapped = accelerator.unwrap_model(model)
-    # model_gate = unwrapped.entity_injection_module.gate
-    # optimizer_gate = optimizer.param_groups[2]['params'][0]  # Gate is in group 2
-
-    # print(f"Model gate id: {id(model_gate)}")
-    # print(f"Optimizer gate id: {id(optimizer_gate)}")
-    # print(f"Same object: {id(model_gate) == id(optimizer_gate)}")
-    # print(f"Model gate data_ptr: {model_gate.data_ptr()}")
-    # print(f"Optimizer gate data_ptr: {optimizer_gate.data_ptr()}")
 
     num_epochs = args.num_epochs
     model.train()
@@ -655,7 +510,7 @@ def train():
                 outputs = model(batch)
                 target_speaker_embedding = outputs['target_speaker_embedding']
                 # Total loss = TTS loss + sub-talker loss + weighted entity type loss
-                loss = outputs['loss'] + outputs['sub_talker_loss'] + args.entity_loss_weight * outputs['entity_type_loss']
+                loss = outputs['loss'] + outputs['sub_talker_loss'] + args.entity_loss_weight * outputs['entity_loss']
 
                 accelerator.backward(loss)
 
@@ -694,17 +549,19 @@ def train():
                             f"Loss: {loss.item():.4f} | "
                             f"TTS: {outputs['loss'].item():.4f} | "
                             f"Sub-talker: {outputs['sub_talker_loss'].item():.4f} | "
-                            f"Entity: {outputs['entity_type_loss'].item():.4f} | "
+                            f"EntityType: {outputs['entity_type_loss'].item():.4f} | "
+                            f"EntityDet: {outputs['entity_detection_loss'].item():.4f} | "
                             f"γ: {gamma_mean:.4f} | β: {beta_mean:.4f}"
                         )
                         
-                        # global_step = int(((epoch * len(train_dataloader)) / gradient_accumulation_steps) + step)
                         accelerator.log(
                             {
                                 "train/loss": loss.item(),
                                 "train/tts_loss": outputs["loss"].item(),
                                 "train/sub_talker_loss": outputs["sub_talker_loss"].item(),
                                 "train/entity_type_loss": outputs["entity_type_loss"].item(),
+                                "train/entity_detection_loss": outputs["entity_detection_loss"].item(),
+                                "train/entity_loss": outputs["entity_loss"].item(),
                                 "train/film_gamma_mean": gamma_mean,
                                 "train/film_beta_mean": beta_mean,
                                 "train/epoch": epoch,
@@ -762,8 +619,6 @@ def train():
                 "entity_injection_config": {
                     "hidden_size": entity_injection_config.hidden_size,
                     "num_entities": entity_injection_config.num_entities,
-                    "pretrained_encoder": entity_injection_config.pretrained_encoder,
-                    "freeze_encoder": entity_injection_config.freeze_encoder,
                     "num_layers": entity_injection_config.num_layers,
                     "num_heads": entity_injection_config.num_heads,
                     "dim_feedforward": entity_injection_config.dim_feedforward,

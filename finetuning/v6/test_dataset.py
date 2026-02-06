@@ -1,48 +1,61 @@
 import os
-import sys
-import tempfile
-import numpy as np
+import json
 import torch
-from datasets import Dataset
-
-# Add parent directory to path for imports
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
+from torch.utils.data import Dataset, DataLoader
 from transformers import AutoConfig
+from tqdm import tqdm
+from datasets import load_from_disk, concatenate_datasets
 
-from test_alignment import create_mock_dataset
 from dataset import TTSDataset
+from qwen_tts import Qwen3TTSModel
 
 
-MODEL_PATH = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+HF_datasets = {
+    "TextNormalisationSyntheticData": "/speech/arjun/shoutrik/DATA/HF_datasets/TextNormOnlyAllTypes",
+}
 
-print(f"\nLoading model from: {MODEL_PATH}")
+MODEL_PATH = "/speech/arjun/.cache/huggingface/hub/models--Qwen--Qwen3-TTS-12Hz-0.6B-Base/snapshots/5d83992436eae1d760afd27aff78a71d676296fc"
 
-# Load model and processor
 qwen3tts = Qwen3TTSModel.from_pretrained(
     MODEL_PATH,
     torch_dtype=torch.bfloat16,
+    attn_implementation="flash_attention_2",
 )
+config = AutoConfig.from_pretrained(MODEL_PATH)
 
-processor = qwen3tts.processor
-config = qwen3tts.model.config
-
-tts_dataset = TTSDataset(
-    dataset_paths={
-        "test": "/speech/arjun/shoutrik/DATA/TextNormalisationSyntheticData",
-    },
-    processor=processor,
+dataset = TTSDataset(
+    dataset_paths=HF_datasets, 
+    processor=qwen3tts.processor, 
     config=config,
     codec_name="qwen3_12hz",
-    lag_num=-1,
 )
 
-for sample in tts_dataset:
-    print(f"id : {sample['id']}")
-    print(f"text_ids : {sample['text_ids'][0].tolist()}")
-    print(f"entities : {sample['entities']}")
-    print(f"text_detokenized :")
-    for i, text_id in enumerate(sample['text_ids'][0].tolist()[3:]):
-        print(f"{i} : {processor.tokenizer.decode(text_id)} | {sample['entities'][i]}", end="\n")
-    print("\n\n")
+train_dataloader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=dataset.collate_fn)
+
+
+for batch in train_dataloader:
+    input_ids = batch["input_ids"]
+    entities = batch["entities"]
+    text_only_mask = batch["text_only_mask"]
+
+    input_text_ids = input_ids[:, :, 0]
+    entity_labels = entities[:, :, 0]
+
+    entity_labels_after_special_mask = entity_labels.clone()
+
+    special_indices = torch.tensor([dataset.entity_type_to_index[t] for t in dataset.special_types])
+    special_mask = torch.isin(entity_labels, special_indices)
+    entity_labels_after_special_mask[special_mask] = -100
+
+    print(f"shape of input_text_ids: {input_text_ids.shape}")
+    print(f"shape of entities: {entity_labels.shape}")
+
+    for t, e, t_only_mask, e_after_special_mask in zip(input_text_ids[0], entity_labels[0], text_only_mask[0], entity_labels_after_special_mask[0]):
+        t = qwen3tts.processor.tokenizer.decode(t)
+        print(f"Text: {t}\tEntity : {e}\tEntity Label: {dataset.index_to_entity_type.get(int(e), 'IGNORED')}\tEntity Label after special mask: {dataset.index_to_entity_type.get(int(e_after_special_mask), 'IGNORED')}\ttext_only_mask: {t_only_mask}\n")
+
+    print("-"*100)
+    print("-"*100)
+
+
+

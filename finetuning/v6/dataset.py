@@ -28,6 +28,7 @@ import json
 from transformers import AutoConfig
 from tqdm import tqdm
 from datasets import load_from_disk, concatenate_datasets
+from torch.utils.data import Sampler
 
 AudioLike = Union[
     str,                     # wav path, URL, base64
@@ -69,11 +70,6 @@ class TTSDataset(Dataset):
         self._filter_dataset()
         self._expand_dataset()
 
-        for sample in self.data_list:
-            print(f"id : {sample['id']}")
-            print(f"text : {sample['text']}")
-            print(f"entities : {sample['entities']}")
-
         self._prepare_entities_map_and_speaker_map()
         self.data_list = self.data_list.map(self._prepare_text_and_entities, batched=True, desc="Preparing text and entities...")
         self.data_list = self.data_list.remove_columns(["text", "entities"])
@@ -87,23 +83,34 @@ class TTSDataset(Dataset):
         print("Speakers : ", self.speaker_map.items())
         print(f"Total duration: {sum(self.data_list['duration']) / 3600} hours")
 
+        self.clean_samples = [idx for idx in range(len(self.data_list)) if self.data_list['dataset_name'][idx] == "hifi"]
+        self.spoken_samples = [idx for idx in range(len(self.data_list)) if self.data_list["id"][idx].endswith("_spoken") and self.data_list['dataset_name'][idx] != "hifi"]
+        self.written_samples = [idx for idx in range(len(self.data_list)) if self.data_list["id"][idx].endswith("_written") and self.data_list['dataset_name'][idx] != "hifi"]
+
+        self.n_tokens = sum(len(data['text_ids'][0]) for data in self.data_list)
+        self.n_entities = sum([sum(1 for id_ in data["entity_label_ids"] if self.index_to_entity_type[id_] not in self.special_types) for data in self.data_list])
+        print(f"Total tokens: {self.n_tokens}")
+        print(f"Total entities: {self.n_entities}")
+
     def _load_dataset(self, dataset_paths):
         print("Loading datasets...")
         datasets_list = []
         for dataset_name, dataset_path in dataset_paths.items():
             print(f"  Loading {dataset_name} from {dataset_path}...")
             dataset = load_from_disk(dataset_path)
-            dataset = dataset.select(range(1))
             dataset = dataset.map(
                 lambda x: {"reference_audio_path": os.path.join(dataset_path, x['reference_audio_path'])},
                 desc=f"Adding root to {dataset_name}"
             )
+            dataset = dataset.add_column("dataset_name", [dataset_name] * len(dataset))
             datasets_list.append(dataset)
             print(f"    Loaded {len(dataset)} samples")
         
         self.data_list = concatenate_datasets(datasets_list)
         print(f"Total samples after concatenation: {len(self.data_list)}")
         self.data_list = self.data_list.shuffle(seed=42)
+        self.samples_per_dataset = {}
+
 
     def _filter_dataset(self):
 
@@ -134,6 +141,7 @@ class TTSDataset(Dataset):
             'reference_audio_sample_rate': [],
             'audio_codes': [],
             'duration': [],
+            "dataset_name": [],
         }
         
         batch_size = len(batch["id"])
@@ -147,16 +155,19 @@ class TTSDataset(Dataset):
             result['reference_audio_sample_rate'].append(batch['reference_audio_sample_rate'][i])
             result['audio_codes'].append(batch[f'audio_codes_{self.codec_name}'][i])
             result["duration"].append(batch['audio_duration'][i])
-            
-            result['id'].append(f"{batch['id'][i]}_written")
-            result['speaker'].append(batch['speaker'][i])
-            result['language'].append(batch['language'][i])
-            result['text'].append(batch['written_text'][i])
-            result['entities'].append(batch['entities'][i])
-            result['reference_audio_path'].append(batch['reference_audio_path'][i])
-            result['reference_audio_sample_rate'].append(batch['reference_audio_sample_rate'][i])
-            result['audio_codes'].append(batch[f'audio_codes_{self.codec_name}'][i])
-            result["duration"].append(batch['audio_duration'][i])
+            result["dataset_name"].append(batch['dataset_name'][i])
+
+            if batch['entities'][i] is not None and len(batch['entities'][i]) > 0:
+                result['id'].append(f"{batch['id'][i]}_written")
+                result['speaker'].append(batch['speaker'][i])
+                result['language'].append(batch['language'][i])
+                result['text'].append(batch['written_text'][i])
+                result['entities'].append(batch['entities'][i])
+                result['reference_audio_path'].append(batch['reference_audio_path'][i])
+                result['reference_audio_sample_rate'].append(batch['reference_audio_sample_rate'][i])
+                result['audio_codes'].append(batch[f'audio_codes_{self.codec_name}'][i])
+                result["duration"].append(batch['audio_duration'][i])
+                result["dataset_name"].append(batch['dataset_name'][i])
         
         return result
     
@@ -174,8 +185,6 @@ class TTSDataset(Dataset):
             if speaker and speaker not in self.speaker_map:
                 reference_audio_path = sample.get("reference_audio_path", "")
                 reference_audio_sample_rate = sample.get("reference_audio_sample_rate", "")
-                print(f"Reference audio path: {reference_audio_path}")
-                print(f"Reference audio sample rate: {reference_audio_sample_rate}")
                 if reference_audio_path:
                     wav = self._load_audio_to_np(reference_audio_path, reference_audio_sample_rate)
                     wav = self._normalize(wav)
@@ -216,7 +225,7 @@ class TTSDataset(Dataset):
         
         return {
             "text_ids": all_text_ids,
-            "entity_label_ids": all_entity_label_ids
+            "entity_label_ids": all_entity_label_ids,
         }
 
 
@@ -430,3 +439,113 @@ class TTSDataset(Dataset):
             'entities':entities,
             'text_only_mask':text_only_mask,  # [B, T] mask for text positions only (for EntityInjectionModule)
         }
+
+
+class DistributedMixedSourceBatchSampler(Sampler):
+    
+    def __init__(self, dataset, batch_size, num_replicas=None, rank=None, shuffle=True):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.num_replicas = num_replicas if num_replicas is not None else 1
+        self.rank = rank if rank is not None else 0
+        self.shuffle = shuffle
+        self.epoch = 0
+        self.n_clean_samples_per_batch = max(1, int(self.batch_size * 0.3))
+        remaining = self.batch_size - self.n_clean_samples_per_batch
+        self.n_spoken_samples_per_batch = int(remaining * 0.4)
+        self.n_written_samples_per_batch = remaining - self.n_spoken_samples_per_batch
+
+        self.clean_indices = dataset.clean_samples.copy()
+        self.spoken_indices = dataset.spoken_samples.copy()
+        self.written_indices = dataset.written_samples.copy()
+        
+    def _build_batches(self):
+        g = torch.Generator()
+        g.manual_seed(self.epoch)
+        
+        if self.shuffle:
+            clean_perm = torch.randperm(len(self.clean_indices), generator=g).tolist()
+            spoken_perm = torch.randperm(len(self.spoken_indices), generator=g).tolist()
+            written_perm = torch.randperm(len(self.written_indices), generator=g).tolist()
+            
+            clean_pool = [self.clean_indices[i] for i in clean_perm]
+            spoken_pool = [self.spoken_indices[i] for i in spoken_perm]
+            written_pool = [self.written_indices[i] for i in written_perm]
+        else:
+            clean_pool = self.clean_indices.copy()
+            spoken_pool = self.spoken_indices.copy()
+            written_pool = self.written_indices.copy()
+        
+        batches = []
+        clean_ptr, spoken_ptr, written_ptr = 0, 0, 0
+        
+        while True:
+            batch = []
+            clean_added = 0
+            if clean_ptr >= len(clean_pool):
+                clean_ptr = 0
+            while clean_added < self.n_clean_samples_per_batch and clean_ptr < len(clean_pool):
+                batch.append(clean_pool[clean_ptr])
+                clean_ptr += 1
+                clean_added += 1
+            
+            spoken_added = 0
+            while spoken_added < self.n_spoken_samples_per_batch and spoken_ptr < len(spoken_pool):
+                batch.append(spoken_pool[spoken_ptr])
+                spoken_ptr += 1
+                spoken_added += 1
+            
+            written_added = 0
+            while written_added < self.n_written_samples_per_batch and written_ptr < len(written_pool):
+                batch.append(written_pool[written_ptr])
+                written_ptr += 1
+                written_added += 1
+            
+            if len(batch) < self.batch_size:
+                while len(batch) < self.batch_size:
+                    if clean_ptr < len(clean_pool):
+                        batch.append(clean_pool[clean_ptr])
+                        clean_ptr += 1
+                    elif spoken_ptr < len(spoken_pool):
+                        batch.append(spoken_pool[spoken_ptr])
+                        spoken_ptr += 1
+                    elif written_ptr < len(written_pool):
+                        batch.append(written_pool[written_ptr])
+                        written_ptr += 1
+                    else:
+                        break
+            
+            if len(batch) < self.batch_size:
+                break
+            
+            if self.shuffle:
+                batch_perm = torch.randperm(len(batch), generator=g).tolist()
+                batch = [batch[i] for i in batch_perm]
+            
+            batches.append(batch)
+        
+        if self.shuffle:
+            batch_order = torch.randperm(len(batches), generator=g).tolist()
+            batches = [batches[i] for i in batch_order]
+        
+        return batches
+    
+    def __iter__(self):
+        batches = self._build_batches()
+        min_batch_size = min(len(batch) for batch in batches)
+        max_batch_size = max(len(batch) for batch in batches)
+        print("Sampler Initialized.")
+        print(f"Min batch size: {min_batch_size}")
+        print(f"Max batch size: {max_batch_size}")
+        rank_batches = batches[self.rank::self.num_replicas]
+        
+        for batch in rank_batches:
+            yield batch
+    
+    def __len__(self):
+        total_samples = len(self.clean_indices) + len(self.spoken_indices) + len(self.written_indices)
+        total_batches = total_samples // self.batch_size
+        return total_batches // self.num_replicas
+    
+    def set_epoch(self, epoch):
+        self.epoch = epoch
