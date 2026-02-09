@@ -90,7 +90,7 @@ class FiLMLayer(nn.Module):
         final_layer = self.film_mlp[-1]
         nn.init.normal_(final_layer.weight, std=0.001)
         nn.init.zeros_(final_layer.bias)
-
+    
     def forward(self, hidden_states, entity_logits, temperature=1.0):
         type_probs = F.softmax(entity_logits / temperature, dim=-1)  # [B, T, num_entities]
         type_emb = type_probs @ self.entity_type_embeddings.weight   # [B, T, D]
@@ -102,6 +102,10 @@ class FiLMLayer(nn.Module):
         # gamma = 1 + offset (so initial gamma ≈ 1)
         # Using tanh to bound gamma_offset to [-1, 1] for stability
         gamma = 1.0 + 0.5 * torch.tanh(gamma_offset)  # gamma in [0.5, 1.5]
+        
+        # Bound beta to prevent it from overwhelming the embeddings
+        # Scale to match embedding magnitude (~0.1-0.2)
+        beta = 0.2 * torch.tanh(beta)  # beta in [-0.2, 0.2]
         
         # Apply FiLM: scale and shift
         conditioned = gamma * hidden_states + beta
@@ -163,10 +167,10 @@ class EntityInjectionModule(nn.Module):
             src_key_padding_mask = (text_mask == 0)
         else:
             src_key_padding_mask = None
-
+        
         text_embeddings = self.positional_embedding(text_embeddings)
         entity_hidden = self.entity_encoder(text_embeddings, src_key_padding_mask=src_key_padding_mask)
-
+        
         entity_logits = self.entity_head(entity_hidden) 
         entity_detection_logits = self.entity_detector(entity_hidden)
         is_entity = torch.sigmoid(entity_detection_logits)
@@ -217,6 +221,10 @@ class Qwen3TTSModelWithEntityInjection(nn.Module):
             return_details=True
         )
         
+        # Only apply entity injection to text positions, preserve original embeddings for header/special tokens
+        text_only_mask_expanded = text_only_mask.unsqueeze(-1).float()
+        conditioned_embedding = input_text_embedding * (1 - text_only_mask_expanded) + conditioned_embedding * text_only_mask_expanded
+        
         conditioned_embedding = conditioned_embedding.to(torch.bfloat16)
         input_text_embedding = self.base_model.talker.text_projection(conditioned_embedding)
 
@@ -241,7 +249,7 @@ class Qwen3TTSModelWithEntityInjection(nn.Module):
             is_entity_labels[positions_valid_for_entity_detection].float().view(-1),
             pos_weight=pos_weight,
         )
-        
+    
         if torch.isnan(entity_type_loss):
             entity_type_loss = 0.0 * entity_logits.sum() + 0.0 * gamma.sum() + 0.0 * beta.sum()
         else:
@@ -468,7 +476,7 @@ def train():
         codec_name="qwen3_12hz",
     )
     sampler = DistributedMixedSourceBatchSampler(dataset, args.batch_size, num_replicas=accelerator.num_processes, rank=accelerator.process_index, shuffle=True)
-    train_dataloader = DataLoader(dataset, batch_sampler=sampler, collate_fn=dataset.collate_fn)
+    train_dataloader = DataLoader(dataset, batch_sampler=sampler, collate_fn=dataset.collate_fn, num_workers=3)
 
     n_entities = dataset.n_entities
     n_tokens = dataset.n_tokens
@@ -477,7 +485,7 @@ def train():
     entity_injection_config = EntityInjectionModuleConfig(
         hidden_size=config.talker_config.text_hidden_size,  # Qwen's text hidden dimension
         num_entities=len(dataset.entity_type_to_index),     # Number of entity types from dataset          # e.g., "distilbert-base-uncased" or None              # Whether to freeze pretrained weights
-        num_layers=2,
+        num_layers=4,
         num_heads=8,
         dim_feedforward=config.talker_config.text_hidden_size * 4,
         dropout=0.1,
@@ -493,6 +501,17 @@ def train():
     model = Qwen3TTSModelWithEntityInjection(qwen3tts.model, config, entity_injection_module, special_indices, special_index, entity_prob).to(accelerator.device)
     for param in model.base_model.speaker_encoder.parameters():
         param.requires_grad = False
+
+    # Compute speaker embeddings for all unique speakers in the dataset
+    accelerator.print(f"Computing speaker embeddings for {len(dataset.speaker_map)} unique speakers...")
+    speaker_embeddings = {}
+    with torch.no_grad():
+        for speaker_name, ref_mel in dataset.speaker_map.items():
+            # ref_mel is [1, T, 128], move to device and compute embedding
+            ref_mel_tensor = ref_mel.to(accelerator.device).to(model.base_model.dtype)
+            speaker_emb = model.base_model.speaker_encoder(ref_mel_tensor).squeeze(0)  # [D]
+            speaker_embeddings[speaker_name] = speaker_emb.detach().cpu()
+    accelerator.print(f"Speaker embeddings computed: {list(speaker_embeddings.keys())}")
 
     optimizer, scheduler = get_optimizer_and_scheduler(model, args, args.num_epochs, len(train_dataloader), gradient_accumulation_steps)
 
@@ -581,12 +600,14 @@ def train():
                 config_dict = json.load(f)
             config_dict["tts_model_type"] = "custom_voice"
             talker_config = config_dict.get("talker_config", {})
-            talker_config["spk_id"] = {
-                args.speaker_name: 3000
-            }
-            talker_config["spk_is_dialect"] = {
-                args.speaker_name: False
-            }
+            # Create spk_id mapping for all speakers (starting from index 3000)
+            spk_id_mapping = {}
+            spk_is_dialect_mapping = {}
+            for idx, speaker_name in enumerate(sorted(speaker_embeddings.keys())):
+                spk_id_mapping[speaker_name.lower()] = 3000 + idx
+                spk_is_dialect_mapping[speaker_name.lower()] = False
+            talker_config["spk_id"] = spk_id_mapping
+            talker_config["spk_is_dialect"] = spk_is_dialect_mapping
             config_dict["talker_config"] = talker_config
 
             with open(output_config_file, 'w', encoding='utf-8') as f:
@@ -602,8 +623,13 @@ def train():
             for k in keys_to_drop:
                 del state_dict[k]
 
+            # Save all speaker embeddings to codec_embedding weights at their respective indices
             weight = state_dict['talker.model.codec_embedding.weight']
-            state_dict['talker.model.codec_embedding.weight'][3000] = target_speaker_embedding[0].detach().to(weight.device).to(weight.dtype)
+            for idx, speaker_name in enumerate(sorted(speaker_embeddings.keys())):
+                spk_emb = speaker_embeddings[speaker_name]
+                state_dict['talker.model.codec_embedding.weight'][3000 + idx] = spk_emb.to(weight.device).to(weight.dtype)
+            accelerator.print(f"Saved {len(speaker_embeddings)} speakers to codec_embedding (indices 3000-{3000 + len(speaker_embeddings) - 1})")
+            
             save_path = os.path.join(output_dir, "model.safetensors")
             save_file(state_dict, save_path)
             
@@ -611,6 +637,14 @@ def train():
             entity_state_dict = {k: v.detach().to("cpu") for k, v in unwrapped_entity_injection_module.state_dict().items()}
             entity_save_path = os.path.join(output_dir, "entity_injection_module.safetensors")
             save_file(entity_state_dict, entity_save_path)
+            
+            # Save each speaker embedding as a separate file
+            speaker_emb_dir = os.path.join(output_dir, "speaker_embeddings")
+            os.makedirs(speaker_emb_dir, exist_ok=True)
+            for speaker_name, spk_emb in speaker_embeddings.items():
+                speaker_file = os.path.join(speaker_emb_dir, f"{speaker_name}.safetensors")
+                save_file({"embedding": spk_emb}, speaker_file)
+            accelerator.print(f"Saved {len(speaker_embeddings)} speaker embeddings to {speaker_emb_dir}/")
             
             # Save entity type mapping for inference
             entity_type_mapping = {

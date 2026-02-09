@@ -10,7 +10,7 @@ set -e
 
 # Model paths
 INIT_MODEL_PATH="/speech/arjun/.cache/huggingface/hub/models--Qwen--Qwen3-TTS-12Hz-0.6B-Base/snapshots/5d83992436eae1d760afd27aff78a71d676296fc"
-OUTPUT_MODEL_PATH="/speech/arjun/shoutrik/Qwen3-TTS/finetuning/v6/experiments/entity_injection_v6.2"
+OUTPUT_MODEL_PATH="/speech/arjun/shoutrik/Qwen3-TTS/finetuning/v6/experiments/entity_injection_v6.3_EntityEncoder_NumLayers4"
 
 # Data
 TRAIN_JSONL="/speech/arjun/shoutrik/DATA/jsonl_files/metadata_with_entities.bkp.jsonl"
@@ -19,7 +19,7 @@ TRAIN_JSONL="/speech/arjun/shoutrik/DATA/jsonl_files/metadata_with_entities.bkp.
 BATCH_SIZE=16
 LEARNING_RATE=1e-6
 NUM_EPOCHS=20
-ENTITY_LOSS_WEIGHT=0.1
+ENTITY_LOSS_WEIGHT=1
 GRADIENT_ACCUMULATION_STEPS=4
 
 # Speaker

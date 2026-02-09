@@ -66,12 +66,10 @@ class TTSDataset(Dataset):
         assert self.processor.tokenizer.is_fast, "Processor must be a fast tokenizer"
 
         self._load_dataset(dataset_paths)
-
         self._filter_dataset()
-        self._expand_dataset()
-
         self._prepare_entities_map_and_speaker_map()
-        self.data_list = self.data_list.map(self._prepare_text_and_entities, batched=True, desc="Preparing text and entities...")
+        self._expand_dataset()
+        self.data_list = self.data_list.map(self._prepare_text_and_entities, batched=True, load_from_cache_file=False, desc="Preparing text and entities...")
         self.data_list = self.data_list.remove_columns(["text", "entities"])
 
 
@@ -83,25 +81,44 @@ class TTSDataset(Dataset):
         print("Speakers : ", self.speaker_map.items())
         print(f"Total duration: {sum(self.data_list['duration']) / 3600} hours")
 
-        self.clean_samples = [idx for idx in range(len(self.data_list)) if self.data_list['dataset_name'][idx] == "hifi"]
-        self.spoken_samples = [idx for idx in range(len(self.data_list)) if self.data_list["id"][idx].endswith("_spoken") and self.data_list['dataset_name'][idx] != "hifi"]
-        self.written_samples = [idx for idx in range(len(self.data_list)) if self.data_list["id"][idx].endswith("_written") and self.data_list['dataset_name'][idx] != "hifi"]
-
-        self.n_tokens = sum(len(data['text_ids'][0]) for data in self.data_list)
-        self.n_entities = sum([sum(1 for id_ in data["entity_label_ids"] if self.index_to_entity_type[id_] not in self.special_types) for data in self.data_list])
+        # Batch-fetch columns once (fast) instead of individual Arrow lookups (slow)
+        print("Building sample indices...")
+        dataset_names = self.data_list['dataset_name']
+        ids = self.data_list['id']
+        text_ids_list = self.data_list['text_ids']
+        entity_label_ids_list = self.data_list['entity_label_ids']
+        
+        self.clean_samples = []
+        self.spoken_samples = []
+        self.written_samples = []
+        self.n_tokens = 0
+        self.n_entities = 0
+        
+        special_indices = {self.entity_type_to_index[t] for t in self.special_types}
+        
+        for idx, (name, id_, text_ids, entity_ids) in enumerate(zip(dataset_names, ids, text_ids_list, entity_label_ids_list)):
+            # Categorize samples
+            if name == "hifi":
+                self.clean_samples.append(idx)
+            elif id_.endswith("_spoken"):
+                self.spoken_samples.append(idx)
+            elif id_.endswith("_written"):
+                self.written_samples.append(idx)
+            
+            # Count tokens and entities
+            self.n_tokens += len(text_ids[0])
+            self.n_entities += sum(1 for eid in entity_ids if eid not in special_indices)
+        
         print(f"Total tokens: {self.n_tokens}")
         print(f"Total entities: {self.n_entities}")
 
     def _load_dataset(self, dataset_paths):
         print("Loading datasets...")
+        self.dataset_paths = dataset_paths  # Store for later use in _expand_samples
         datasets_list = []
         for dataset_name, dataset_path in dataset_paths.items():
             print(f"  Loading {dataset_name} from {dataset_path}...")
             dataset = load_from_disk(dataset_path)
-            dataset = dataset.map(
-                lambda x: {"reference_audio_path": os.path.join(dataset_path, x['reference_audio_path'])},
-                desc=f"Adding root to {dataset_name}"
-            )
             dataset = dataset.add_column("dataset_name", [dataset_name] * len(dataset))
             datasets_list.append(dataset)
             print(f"    Loaded {len(dataset)} samples")
@@ -115,7 +132,7 @@ class TTSDataset(Dataset):
     def _filter_dataset(self):
 
         duration_before_filter = sum(self.data_list['audio_duration']) / 3600
-        self.data_list = self.data_list.filter(lambda x: x['audio_duration'] > 2 and x['audio_duration'] < 30)
+        self.data_list = self.data_list.filter(lambda x: x['audio_duration'] > 2 and x['audio_duration'] < 30, load_from_cache_file=False)
         duration_after_filter = sum(self.data_list['audio_duration']) / 3600
         print(f"Total samples after filtering for duration between 2 and 30 seconds: {len(self.data_list)}")
         print(f"Duration before filter: {duration_before_filter} hours")
@@ -127,6 +144,7 @@ class TTSDataset(Dataset):
             self._expand_samples, 
             batched=True, 
             remove_columns=self.data_list.column_names,
+            load_from_cache_file=False,
             desc="Expanding samples..."
         )
 
@@ -137,8 +155,6 @@ class TTSDataset(Dataset):
             'language': [],
             'text': [],
             'entities': [],
-            'reference_audio_path': [],
-            'reference_audio_sample_rate': [],
             'audio_codes': [],
             'duration': [],
             "dataset_name": [],
@@ -146,16 +162,16 @@ class TTSDataset(Dataset):
         
         batch_size = len(batch["id"])
         for i in range(batch_size):
+            dataset_name = batch['dataset_name'][i]
+            
             result['id'].append(f"{batch['id'][i]}_spoken")
             result['speaker'].append(batch['speaker'][i])
             result['language'].append(batch['language'][i])
             result['text'].append(batch['spoken_text'][i])
             result['entities'].append(None)
-            result['reference_audio_path'].append(batch['reference_audio_path'][i])
-            result['reference_audio_sample_rate'].append(batch['reference_audio_sample_rate'][i])
             result['audio_codes'].append(batch[f'audio_codes_{self.codec_name}'][i])
             result["duration"].append(batch['audio_duration'][i])
-            result["dataset_name"].append(batch['dataset_name'][i])
+            result["dataset_name"].append(dataset_name)
 
             if batch['entities'][i] is not None and len(batch['entities'][i]) > 0:
                 result['id'].append(f"{batch['id'][i]}_written")
@@ -163,11 +179,9 @@ class TTSDataset(Dataset):
                 result['language'].append(batch['language'][i])
                 result['text'].append(batch['written_text'][i])
                 result['entities'].append(batch['entities'][i])
-                result['reference_audio_path'].append(batch['reference_audio_path'][i])
-                result['reference_audio_sample_rate'].append(batch['reference_audio_sample_rate'][i])
                 result['audio_codes'].append(batch[f'audio_codes_{self.codec_name}'][i])
                 result["duration"].append(batch['audio_duration'][i])
-                result["dataset_name"].append(batch['dataset_name'][i])
+                result["dataset_name"].append(dataset_name)
         
         return result
     
@@ -185,8 +199,11 @@ class TTSDataset(Dataset):
             if speaker and speaker not in self.speaker_map:
                 reference_audio_path = sample.get("reference_audio_path", "")
                 reference_audio_sample_rate = sample.get("reference_audio_sample_rate", "")
-                if reference_audio_path:
-                    wav = self._load_audio_to_np(reference_audio_path, reference_audio_sample_rate)
+                dataset_name = sample.get("dataset_name", "")
+                if reference_audio_path and dataset_name:
+                    # Construct full path using dataset_paths
+                    full_ref_path = os.path.join(self.dataset_paths[dataset_name], reference_audio_path)
+                    wav = self._load_audio_to_np(full_ref_path, reference_audio_sample_rate)
                     wav = self._normalize(wav)
                     ref_mel = self.extract_mels(audio=wav)
                     self.speaker_map[speaker] = ref_mel
@@ -199,11 +216,6 @@ class TTSDataset(Dataset):
         self.index_to_entity_type = {v: k for k, v in self.entity_type_to_index.items()}
 
         speaker_map = dict(sorted(self.speaker_map.items(), key=lambda x: x[0]))
-        # Only remove columns that exist (dataset_root may not exist after expansion)
-        columns_to_remove = [c for c in ["reference_audio_path", "reference_audio_sample_rate", "dataset_root"] 
-                             if c in self.data_list.column_names]
-        if columns_to_remove:
-            self.data_list = self.data_list.remove_columns(columns_to_remove)
 
 
     def _prepare_text_and_entities(self, batch):
@@ -460,6 +472,7 @@ class DistributedMixedSourceBatchSampler(Sampler):
         self.written_indices = dataset.written_samples.copy()
         
     def _build_batches(self):
+        print(f"Building batches for epoch {self.epoch}...")
         g = torch.Generator()
         g.manual_seed(self.epoch)
         
@@ -480,10 +493,15 @@ class DistributedMixedSourceBatchSampler(Sampler):
         clean_ptr, spoken_ptr, written_ptr = 0, 0, 0
         
         while True:
+            # Termination condition: spoken AND written pools are exhausted
+            # (clean can wrap around since it's only ~10% of data and we want it in every batch)
+            if spoken_ptr >= len(spoken_pool) and written_ptr >= len(written_pool):
+                break
+            
             batch = []
             clean_added = 0
             if clean_ptr >= len(clean_pool):
-                clean_ptr = 0
+                clean_ptr = 0  # Wrap around - clean samples repeat to ensure every batch has HiFi data
             while clean_added < self.n_clean_samples_per_batch and clean_ptr < len(clean_pool):
                 batch.append(clean_pool[clean_ptr])
                 clean_ptr += 1
